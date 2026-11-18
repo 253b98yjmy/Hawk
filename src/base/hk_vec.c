@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include "base/hk_vec.h"
+
+void *hk_vec_grow_(void *data, uint32_t *cap, size_t elem_size, uint64_t min_cap)
+{
+    HK_ASSERT(elem_size > 0);
+    HK_ASSERT(min_cap <= UINT32_MAX);
+    uint64_t new_cap = *cap ? (uint64_t)*cap * 2 : 8;
+    if (new_cap < min_cap) new_cap = min_cap;
+    if (new_cap > UINT32_MAX) new_cap = UINT32_MAX;
+    HK_ASSERT(new_cap <= SIZE_MAX / elem_size);
+    void *nd = hk_realloc(data, (size_t)*cap * elem_size, (size_t)new_cap * elem_size);
+    *cap = (uint32_t)new_cap;
+    return nd;
+}
