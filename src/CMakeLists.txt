@@ -72,6 +72,9 @@ add_library(hk_net STATIC
     net/hk_cookies.c
     net/hk_cache.c
     blocker/hk_blocker.c
+    blocker/hk_filter_compile.c
+    blocker/hk_filter_store.c
+    blocker/hk_regex.c
 )
 target_link_libraries(hk_net PUBLIC hk_base hk_plat PRIVATE hk_zlib)
 

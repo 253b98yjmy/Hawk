@@ -33,12 +33,16 @@ typedef struct hk_load_callbacks {
 
 /* blocker may be NULL; it must outlive the loader. data_dir (may be NULL) holds cookies and the cache. */
 hk_loader *hk_loader_create(const hk_blocker *blocker, const char *data_dir);
+/* Replaces the blocker for requests that start from now on. Any thread. release(ctx) is called
+ * (on the I/O thread) once the loader no longer uses b: after the next swap or at destroy. */
+void hk_loader_set_blocker(hk_loader *l, const hk_blocker *b, void (*release)(void *ctx), void *ctx);
 /* Cancels outstanding requests and stops the I/O thread. */
 void hk_loader_destroy(hk_loader *l);
 
 /* Starts a fetch; returns its id. Main thread only. site is the top-level page URL for subresources
- * (cookies and the cache are partitioned by it) and empty for navigations. */
-uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, const hk_load_callbacks *cb);
+ * (cookies and the cache are partitioned by it) and empty for navigations. type is one HK_REQ_*
+ * (the content blocker's request type); navigations are always HK_REQ_DOCUMENT. */
+uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, uint32_t type, const hk_load_callbacks *cb);
 /* Fetches and decodes an image on the I/O thread, scaled down to fit max_w x max_h (0 = original size). */
 uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
                                const hk_load_callbacks *cb);

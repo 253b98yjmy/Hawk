@@ -13,7 +13,7 @@
 #include "base/hk_log.h"
 #include "base/hk_map64.h"
 #include "base/hk_mem.h"
-#include "blocker/hk_blocker.h"
+#include "blocker/hk_filter_store.h"
 #include "css/hk_css.h"
 #include "dom/hk_dom.h"
 #include "html/hk_html_parser.h"
@@ -100,7 +100,7 @@ typedef struct history_entry {
 struct app {
     hk_window *window;
     hk_loader *loader;
-    hk_blocker blocker;
+    char data_dir[512]; /* empty when there is no per-user data directory */
     hk_painter *painter;
     page page;
     float scroll; /* CSS px */
@@ -620,7 +620,8 @@ static void start_sheet(app *a, uint32_t index)
 {
     sheet_slot *s = a->page.sheets.data[index];
     hk_load_callbacks cb = {s, NULL, on_sheet_data, on_sheet_done};
-    s->load_id = hk_loader_fetch(a->loader, (hk_str){s->url, s->url_len}, hk_str_from_cstr(a->page.url), &cb);
+    s->load_id = hk_loader_fetch(a->loader, (hk_str){s->url, s->url_len}, hk_str_from_cstr(a->page.url),
+                                 HK_REQ_STYLESHEET, &cb);
 }
 
 static hk_str text_content(const hk_document *d, hk_node_id el, hk_charbuf *buf)
@@ -831,6 +832,8 @@ static void on_done(void *user, hk_status st, const char *message)
     }
 }
 
+static void show_internal(app *a, const char *url);
+
 static void navigate(app *a, const char *url, bool push)
 {
     if (push) {
@@ -845,11 +848,16 @@ static void navigate(app *a, const char *url, bool push)
     page_reset(a);
     page *pg = &a->page;
     snprintf(pg->url, sizeof pg->url, "%s", url);
+    pg->t_start = hk_plat_now_ns();
+    if (strncmp(url, "hawk:", 5) == 0) {
+        show_internal(a, url);
+        return;
+    }
     pg->loading = true;
     pg->t_start = hk_plat_now_ns();
     hk_window_set_cursor(a->window, HK_CURSOR_WAIT);
     hk_load_callbacks cb = {a, on_response, on_data, on_done};
-    pg->load_id = hk_loader_fetch(a->loader, hk_str_from_cstr(url), HK_STR(""), &cb);
+    pg->load_id = hk_loader_fetch(a->loader, hk_str_from_cstr(url), HK_STR(""), HK_REQ_DOCUMENT, &cb);
 }
 
 static void go_history(app *a, int delta)
@@ -869,6 +877,12 @@ static void follow_link(app *a, hk_node_id link)
 {
     page *pg = &a->page;
     const hk_attr *href = hk_dom_attr(pg->doc, link, HK_ATTR_NS_NONE, A(href));
+    if (href && hk_str_starts_with(href->value, HK_STR("hawk:"))) {
+        char internal[256];
+        snprintf(internal, sizeof internal, "%.*s", (int)href->value.n, href->value.p);
+        navigate(a, internal, true);
+        return;
+    }
     if (!href || !pg->has_base) return;
     hk_url u;
     if (hk_url_parse(&pg->url_arena, href->value, &pg->base, &u) != HK_OK) return;
@@ -1001,28 +1015,77 @@ static void on_first_present(void *user, hk_window *w)
 
 /* --- startup ------------------------------------------------------------------------------------------ */
 
-static void load_filter_file(void *user, const char *path)
-{
-    hk_blocker *b = user;
-    hk_charbuf text = {0};
-    if (hk_plat_read_file(path, &text) == HK_OK) {
-        uint32_t n = hk_blocker_add_list(b, (hk_str){text.data, text.len});
-        HK_LOGI("filter list %s: %u host filters", path, n);
-    } else {
-        HK_LOGW("cannot read filter list %s", path);
-    }
-    hk_vec_free(&text);
-}
-
 static const char k_start_page[] =
     "<!doctype html><title>Hawk</title>"
     "<body style='font-family: sans-serif; margin: 4em auto; max-width: 40em; color: #333'>"
     "<h1 style='font-weight: 300'>Hawk</h1>"
-    "<p>M2: CSS \xE3\x81\xA8\xE3\x83\xAC\xE3\x82\xA4\xE3\x82\xA2\xE3\x82\xA6\xE3\x83\x88\xE3\x80\x82"
-    " URL \xE3\x82\x92\xE3\x82\xB3\xE3\x83\x9E\xE3\x83\xB3\xE3\x83\x89\xE3\x83\xA9\xE3\x82\xA4\xE3\x83\xB3\xE3\x81\xA7"
+    "<p>URL \xE3\x82\x92\xE3\x82\xB3\xE3\x83\x9E\xE3\x83\xB3\xE3\x83\x89\xE3\x83\xA9\xE3\x82\xA4\xE3\x83\xB3\xE3\x81\xA7"
     "\xE6\x8C\x87\xE5\xAE\x9A\xE3\x81\x97\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82</p>"
     "<p><code>hawk.exe https://ja.wikipedia.org/</code></p>"
     "<ul><li>Alt+\xE2\x86\x90 / Alt+\xE2\x86\x92: back / forward<li>F5: reload<li>Esc: stop</ul>";
+
+/* フィルタリスト / ブロッカー用のフィルタリストがまだありません。 / 既定のリストをダウンロードする */
+static const char k_lists_missing[] =
+    "<h2 style='font-weight: 400'>\xE3\x83\x95\xE3\x82\xA3\xE3\x83\xAB\xE3\x82\xBF\xE3\x83\xAA\xE3\x82\xB9\xE3\x83\x88"
+    "</h2><p>\xE3\x83\x96\xE3\x83\xAD\xE3\x83\x83\xE3\x82\xAB\xE3\x83\xBC\xE7\x94\xA8\xE3\x81\xAE\xE3\x83\x95\xE3\x82\xA3"
+    "\xE3\x83\xAB\xE3\x82\xBF\xE3\x83\xAA\xE3\x82\xB9\xE3\x83\x88\xE3\x81\x8C\xE3\x81\xBE\xE3\x81\xA0\xE3\x81\x82\xE3\x82"
+    "\x8A\xE3\x81\xBE\xE3\x81\x9B\xE3\x82\x93\xE3\x80\x82 EasyList, EasyPrivacy, uBlock filters, AdGuard Japanese, "
+    "Peter Lowe's list</p>"
+    "<p><a href='hawk:update-filters'>\xE6\x97\xA2\xE5\xAE\x9A\xE3\x81\xAE\xE3\x83\xAA\xE3\x82\xB9\xE3\x83\x88\xE3\x82"
+    "\x92\xE3\x83\x80\xE3\x82\xA6\xE3\x83\xB3\xE3\x83\xAD\xE3\x83\xBC\xE3\x83\x89\xE3\x81\x99\xE3\x82\x8B</a></p>";
+
+static void show_html(app *a, const char *html, size_t n)
+{
+    page *pg = &a->page;
+    pg->doc = hk_html_parse(html, n);
+    pg->parsed = true;
+    pg->html = true;
+    bool exit_after = a->exit_after_load;
+    a->exit_after_load = false;
+    show_document(a);
+    a->exit_after_load = exit_after;
+}
+
+static void on_filters_updated(void *user, const char *summary)
+{
+    app *a = user;
+    HK_LOGI("filter lists: %s", summary);
+    if (strcmp(a->page.url, "hawk:update-filters") == 0) {
+        if (a->exit_after_load) {
+            hk_window_close(a->window);
+            return;
+        }
+        /* フィルタリストを更新しました */
+        show_message(a,
+                     "\xE3\x83\x95\xE3\x82\xA3\xE3\x83\xAB\xE3\x82\xBF\xE3\x83\xAA\xE3\x82\xB9\xE3\x83\x88\xE3\x82\x92"
+                     "\xE6\x9B\xB4\xE6\x96\xB0\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x97\xE3\x81\x9F",
+                     summary);
+    }
+}
+
+static void show_internal(app *a, const char *url)
+{
+    hk_window_set_cursor(a->window, HK_CURSOR_ARROW);
+    if (strcmp(url, "hawk:update-filters") == 0 && a->data_dir[0]) {
+        bool exit_after = a->exit_after_load;
+        a->exit_after_load = false;
+        /* フィルタリストをダウンロードしています… */
+        show_message(a,
+                     "\xE3\x83\x95\xE3\x82\xA3\xE3\x83\xAB\xE3\x82\xBF\xE3\x83\xAA\xE3\x82\xB9\xE3\x83\x88\xE3\x82\x92"
+                     "\xE3\x83\x80\xE3\x82\xA6\xE3\x83\xB3\xE3\x83\xAD\xE3\x83\xBC\xE3\x83\x89\xE3\x81\x97\xE3\x81\xA6"
+                     "\xE3\x81\x84\xE3\x81\xBE\xE3\x81\x99\xE2\x80\xA6",
+                     "EasyList, EasyPrivacy, uBlock filters, AdGuard Japanese, Peter Lowe's list");
+        a->exit_after_load = exit_after; /* --exit-after-load waits for the lists */
+        hk_filter_lists_update(a->loader, a->data_dir, true, on_filters_updated, a);
+        return;
+    }
+    hk_charbuf h = {0};
+    hk_charbuf_append(&h, k_start_page, sizeof k_start_page - 1);
+    if (hk_filter_lists_missing(a->data_dir[0] ? a->data_dir : NULL))
+        hk_charbuf_append(&h, k_lists_missing, sizeof k_lists_missing - 1);
+    show_html(a, h.data, h.len);
+    hk_vec_free(&h);
+}
 
 int hk_app_main(int argc, char **argv)
 {
@@ -1030,29 +1093,30 @@ int hk_app_main(int argc, char **argv)
     const char *url = NULL;
     int width_css = 1200;
     hk_names_init();
-    hk_blocker_init(&a.blocker);
+    const char *extra_lists[8];
+    int nextra = 0;
+    bool update_filters = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--smoke") == 0) a.smoke = true;
         else if (strcmp(argv[i], "--exit-after-load") == 0) a.exit_after_load = true;
         else if (strcmp(argv[i], "--wait-images") == 0) a.wait_images = true;
-        else if (strcmp(argv[i], "--filters") == 0 && i + 1 < argc) load_filter_file(&a.blocker, argv[++i]);
+        else if (strcmp(argv[i], "--filters") == 0 && i + 1 < argc) {
+            if (nextra < 8) extra_lists[nextra++] = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--update-filters") == 0) update_filters = true;
         else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) a.screenshot = argv[++i];
         else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width_css = atoi(argv[++i]);
         else if (argv[i][0] != '-' && !url) url = argv[i];
         else HK_LOGW("unknown argument: %s", argv[i]);
     }
     hk_charbuf dir = {0};
-    if (hk_plat_data_dir(&dir)) {
-        hk_charbuf_append(&dir, "\\filters", 9); /* includes the NUL */
-        hk_plat_list_files(dir.data, ".txt", load_filter_file, &a.blocker);
-    }
+    if (hk_plat_data_dir(&dir) && dir.len < sizeof a.data_dir) memcpy(a.data_dir, dir.data, dir.len);
     hk_vec_free(&dir);
-
-    hk_charbuf data_dir = {0};
-    if (hk_plat_data_dir(&data_dir)) hk_charbuf_push(&data_dir, 0);
-    a.loader = hk_loader_create(&a.blocker, data_dir.len ? data_dir.data : NULL);
-    hk_vec_free(&data_dir);
+    const char *data_dir = a.data_dir[0] ? a.data_dir : NULL;
+    a.loader = hk_loader_create(NULL, data_dir);
+    hk_filter_store *store = hk_filter_store_open(data_dir, extra_lists, nextra);
+    hk_loader_set_blocker(a.loader, hk_filter_store_blocker(store), hk_filter_store_release, store);
     a.painter = hk_painter_create();
     hk_arena_init(&a.page.url_arena, 4096);
 
@@ -1073,15 +1137,13 @@ int hk_app_main(int argc, char **argv)
         HK_LOGE("could not create the main window: %s", hk_status_name(st));
         return 1;
     }
-    if (url) {
-        navigate(&a, url, true);
+    if (update_filters) {
+        navigate(&a, "hawk:update-filters", true); /* every default list, now */
     } else {
-        a.page.doc = hk_html_parse(k_start_page, sizeof k_start_page - 1);
-        a.page.parsed = true;
-        bool exit_after = a.exit_after_load;
-        a.exit_after_load = false;
-        show_document(&a);
-        a.exit_after_load = exit_after;
+        navigate(&a, url ? url : "hawk:start", true);
+        /* Lists that are due are refreshed in the background (the first download is the user's call). */
+        if (data_dir && !hk_filter_lists_missing(data_dir))
+            hk_filter_lists_update(a.loader, data_dir, false, on_filters_updated, &a);
     }
     int rc = hk_plat_run_loop();
 
@@ -1090,6 +1152,5 @@ int hk_app_main(int argc, char **argv)
     hk_arena_free(&a.page.url_arena);
     hk_painter_destroy(a.painter);
     hk_vec_free(&a.history);
-    hk_blocker_free(&a.blocker);
     return rc;
 }

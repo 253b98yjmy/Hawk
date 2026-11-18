@@ -1,41 +1,32 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* The algorithm of https://publicsuffix.org/list/ ("Formal Algorithm") over a sorted rule array. */
+/* The algorithm of https://publicsuffix.org/list/ ("Formal Algorithm") over a hash table of the rules. */
 #include "net/hk_psl.h"
 
 #include <string.h>
 
 #include "net/hk_psl_data.inc"
 
-static int cmp_rule(hk_str s, const char *rule)
+/* FNV-1a, as in tools/gen_psl.py; a prefix ("!" or "*.") is hashed first. */
+static uint64_t rule_hash(const char *prefix, hk_str s)
 {
-    size_t n = strlen(rule);
-    size_t m = s.n < n ? s.n : n;
-    int r = memcmp(s.p, rule, m);
-    if (r) return r;
-    return s.n < n ? -1 : s.n > n;
-}
-
-static bool has_rule(hk_str s)
-{
-    size_t lo = 0, hi = HK_PSL_RULES;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        int r = cmp_rule(s, k_psl_rules[mid]);
-        if (r == 0) return true;
-        if (r < 0) hi = mid;
-        else lo = mid + 1;
-    }
-    return false;
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (const char *p = prefix; *p; p++) h = (h ^ (uint8_t)*p) * 0x100000001B3ull;
+    for (size_t i = 0; i < s.n; i++) h = (h ^ (uint8_t)s.p[i]) * 0x100000001B3ull;
+    return h ? h : 1;
 }
 
 static bool rule_with_prefix(const char *prefix, hk_str s)
 {
-    char buf[300];
-    size_t pn = strlen(prefix);
-    if (s.n + pn >= sizeof buf) return false;
-    memcpy(buf, prefix, pn);
-    memcpy(buf + pn, s.p, s.n);
-    return has_rule((hk_str){buf, pn + s.n});
+    uint64_t h = rule_hash(prefix, s);
+    for (uint32_t i = (uint32_t)h & (HK_PSL_CAP - 1);; i = (i + 1) & (HK_PSL_CAP - 1)) {
+        if (k_psl_table[i] == h) return true;
+        if (!k_psl_table[i]) return false;
+    }
+}
+
+static bool has_rule(hk_str s)
+{
+    return rule_with_prefix("", s);
 }
 
 static bool is_ip(hk_str h)

@@ -1,0 +1,31 @@
+# type url site: a mix of first-party resources, CDNs, ads and trackers
+doc https://www.itmedia.co.jp/news/articles/2411/19/news123.html
+css https://www.itmedia.co.jp/css/base.css https://www.itmedia.co.jp/
+img https://image.itmedia.co.jp/news/articles/2411/19/l_ts1234.jpg https://www.itmedia.co.jp/
+img https://www.google-analytics.com/collect?v=1&tid=UA-1&cid=1 https://www.itmedia.co.jp/
+img https://pagead2.googlesyndication.com/pagead/imgad?id=123 https://www.itmedia.co.jp/
+img https://securepubads.g.doubleclick.net/pcs/view?xai=AKA https://www.itmedia.co.jp/
+img https://www.facebook.com/tr?id=1&ev=PageView https://www.itmedia.co.jp/
+img https://bat.bing.com/action/0?ti=1 https://www.itmedia.co.jp/
+img https://sb.scorecardresearch.com/p?c1=2&c2=1 https://www.itmedia.co.jp/
+font https://fonts.gstatic.com/s/notosansjp/v52/abc.woff2 https://www.itmedia.co.jp/
+css https://fonts.googleapis.com/css2?family=Noto+Sans+JP https://www.itmedia.co.jp/
+img https://upload.wikimedia.org/wikipedia/commons/thumb/a/a1/Example.jpg/320px-Example.jpg https://ja.wikipedia.org/
+img https://ja.wikipedia.org/static/images/icons/wikipedia.png https://ja.wikipedia.org/
+img https://www.example.com/images/ads/banner_728x90.gif https://www.example.com/
+img https://www.example.com/ad/300x250/creative.png https://www.example.com/
+img https://cdn.example.net/static/logo.svg https://www.example.com/
+img https://ad.yieldmanager.com/pixel?id=1 https://www.example.com/
+img https://track.adform.net/Serving/TrackPoint/?pm=1 https://www.example.com/
+img https://counter.example.jp/cgi-bin/count.cgi?id=1 https://www.example.jp/
+img https://i.ytimg.com/vi/abc/hqdefault.jpg https://www.youtube.com/
+img https://news.ycombinator.com/y18.svg https://news.ycombinator.com/
+img https://s.yimg.jp/images/top/sp2/cmn/logo-170307.png https://www.yahoo.co.jp/
+img https://b92.yahoo.co.jp/pagead/conversion?a=1 https://www.yahoo.co.jp/
+img https://amd.c.yimg.jp/im_siggW1/~tmp/abc.jpg https://www.yahoo.co.jp/
+other https://www.example.com/api/v1/items?id=1&utm_source=newsletter https://www.example.com/
+doc https://doubleclick.net/
+doc https://www.amazon.co.jp/dp/B000000000?tag=abc-22
+img https://m.media-amazon.com/images/I/41abc.jpg https://www.amazon.co.jp/
+img https://fls-fe.amazon.co.jp/1/batch/1/OP/A1VC38T7YXB528:1:1 https://www.amazon.co.jp/
+img https://aax-fe.amazon-adsystem.com/e/xsp/getAd?x=1 https://www.amazon.co.jp/

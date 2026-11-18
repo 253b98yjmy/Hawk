@@ -173,3 +173,69 @@ int64_t hk_plat_unix_time(void)
     uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     return (int64_t)(t / 10000000ull) - 11644473600ll;
 }
+
+static bool file_attributes(const char *path, WIN32_FILE_ATTRIBUTE_DATA *fa)
+{
+    hk_arena a;
+    hk_arena_init(&a, 1024);
+    BOOL ok = GetFileAttributesExW(to_wide(&a, path), GetFileExInfoStandard, fa);
+    hk_arena_free(&a);
+    return ok && !(fa->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+uint64_t hk_plat_file_stamp(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!file_attributes(path, &fa)) return 0;
+    uint64_t size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    uint64_t t = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    uint64_t parts[2] = {size, t};
+    uint64_t h = hk_hash64(parts, sizeof parts);
+    return h ? h : 1;
+}
+
+int64_t hk_plat_file_age(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!file_attributes(path, &fa)) return -1;
+    uint64_t t = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    int64_t written = (int64_t)(t / 10000000ull) - 11644473600ll;
+    int64_t age = hk_plat_unix_time() - written;
+    return age < 0 ? 0 : age;
+}
+
+bool hk_plat_map_file(const char *path, hk_mapped_file *out)
+{
+    memset(out, 0, sizeof *out);
+    hk_arena a;
+    hk_arena_init(&a, 1024);
+    HANDLE f = CreateFileW(to_wide(&a, path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    hk_arena_free(&a);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size;
+    bool ok = false;
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < 1024ll * 1024 * 1024) {
+        HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (m) {
+            const void *view = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+            if (view) {
+                out->data = view;
+                out->size = (size_t)size.QuadPart;
+                out->handle = m;
+                ok = true;
+            } else {
+                CloseHandle(m);
+            }
+        }
+    }
+    CloseHandle(f); /* the mapping keeps the file open */
+    return ok;
+}
+
+void hk_plat_unmap_file(hk_mapped_file *m)
+{
+    if (m->data) UnmapViewOfFile(m->data);
+    if (m->handle) CloseHandle(m->handle);
+    memset(m, 0, sizeof *m);
+}

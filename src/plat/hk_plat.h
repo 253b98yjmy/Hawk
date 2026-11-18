@@ -51,6 +51,20 @@ int64_t hk_plat_unix_time(void);
 /* Calls fn for each regular file in dir whose name ends with suffix (full UTF-8 paths). */
 void hk_plat_list_files(const char *dir, const char *suffix, void (*fn)(void *user, const char *path),
                         void *user);
+/* Changes whenever the file is rewritten (size and last write time); 0 when it does not exist. */
+uint64_t hk_plat_file_stamp(const char *path);
+/* Seconds since the file was last written, or -1. */
+int64_t hk_plat_file_age(const char *path);
+
+/* A read-only view of a whole file. */
+typedef struct hk_mapped_file {
+    const void *data;
+    size_t size;
+    void *handle;
+} hk_mapped_file;
+
+bool hk_plat_map_file(const char *path, hk_mapped_file *out);
+void hk_plat_unmap_file(hk_mapped_file *m);
 
 /* Primary language of the user interface is Japanese (decides the legacy encoding fallback). */
 bool hk_plat_locale_is_japanese(void);

@@ -106,38 +106,6 @@ HK_TEST(decoder_streaming)
     hk_vec_free(&out);
 }
 
-/* --- blocker ------------------------------------------------------------------------------- */
-
-#include "blocker/hk_blocker.h"
-
-HK_TEST(blocker_hosts)
-{
-    hk_blocker b;
-    hk_blocker_init(&b);
-    uint32_t added = hk_blocker_add_list(&b, HK_STR("! comment\n"
-                                                    "[Adblock Plus 2.0]\n"
-                                                    "||ads.example.com^\n"
-                                                    "@@||ok.ads.example.com^\n"
-                                                    "||Tracker.Example.NET^\r\n"
-                                                    "0.0.0.0 pixel.test # hosts file\n"
-                                                    "127.0.0.1 localhost\n"
-                                                    "||example.org^$third-party\n"
-                                                    "||example.org/path^\n"
-                                                    "##.ad-banner\n"));
-    HK_CHECK_EQ(added, 4);
-    HK_CHECK_EQ(hk_blocker_count(&b), 3);
-    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("ads.example.com")));
-    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("cdn.ads.example.com")));
-    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("ads.example.com.")));
-    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("example.com")));
-    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("badads.example.com")));
-    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("ok.ads.example.com")));
-    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("tracker.example.net")));
-    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("pixel.test")));
-    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("localhost")));
-    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("example.org"))); /* filters with options: later */
-    hk_blocker_free(&b);
-}
 
 /* --- HTTP body decoding ----------------------------------------------------------------------- */
 

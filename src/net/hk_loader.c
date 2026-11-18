@@ -25,6 +25,7 @@ typedef struct request {
     size_t url_len;
     volatile int64_t cancelled;
     bool image;
+    uint32_t type; /* HK_REQ_* */
     int image_w, image_h;
     hk_charbuf body; /* image requests: the whole body (I/O thread) */
     char *site;      /* top-level page URL; NULL for navigations (each hop is its own site) */
@@ -32,7 +33,13 @@ typedef struct request {
 } request;
 
 struct hk_loader {
-    const hk_blocker *blocker;
+    const hk_blocker *blocker; /* I/O thread; replaced between requests */
+    void (*blocker_release)(void *);
+    void *blocker_ctx;
+    bool swap_pending; /* guarded by lock */
+    const hk_blocker *next_blocker;
+    void (*next_release)(void *);
+    void *next_ctx;
     hk_thread *thread;
     hk_mutex lock;
     hk_cond wake;
@@ -371,16 +378,33 @@ static void run_request(hk_loader *l, request *r)
             snprintf(err, sizeof err, "unsupported URL scheme");
             break;
         }
-        if (l->blocker && hk_blocker_blocks_host(l->blocker, url.host)) {
-            st = HK_ERR_BLOCKED;
-            snprintf(err, sizeof err, "blocked by the content blocker: %.*s", (int)url.host.n, url.host.p);
-            break;
-        }
-        /* The top-level site decides cookies and the cache partition. */
+        /* The top-level site decides cookies, the cache partition and third-party filters. */
         hk_str site_host = url.host;
-        hk_url site_url;
-        if (r->site && hk_url_parse(&a, (hk_str){r->site, r->site_len}, NULL, &site_url) == HK_OK)
-            site_host = site_url.host;
+        hk_url site_url = {0};
+        bool have_site = r->site && hk_url_parse(&a, (hk_str){r->site, r->site_len}, NULL, &site_url) == HK_OK;
+        if (have_site) site_host = site_url.host;
+        if (l->blocker) {
+            hk_block_request br = {url.href, url.host, have_site ? site_url.href : (hk_str){0}, site_host, r->type};
+            hk_charbuf stripped = {0};
+            hk_url clean;
+            if (hk_blocker_strip_params(l->blocker, &br, &stripped) &&
+                hk_url_parse(&a, (hk_str){stripped.data, stripped.len}, NULL, &clean) == HK_OK) {
+                HK_LOGD("removeparam: %.*s", (int)clean.href.n, clean.href.p);
+                url = clean;
+                br.url = url.href;
+            }
+            hk_vec_free(&stripped);
+            hk_block_result res = hk_blocker_match(l->blocker, &br);
+            if (res.blocked) {
+                hk_str list = hk_blocker_filter_list(l->blocker, res.filter);
+                st = HK_ERR_BLOCKED;
+                snprintf(err, sizeof err, "blocked by the content blocker (%.*s:%u): %.*s", (int)list.n, list.p,
+                         hk_blocker_filter_line(l->blocker, res.filter), (int)url.host.n, url.host.p);
+                HK_LOGI("blocked (%.*s:%u): %.*s", (int)list.n, list.p, hk_blocker_filter_line(l->blocker, res.filter),
+                        (int)(url.href.n < 160 ? url.href.n : 160), url.href.p);
+                break;
+            }
+        }
         hk_str partition = hk_psl_registrable_domain(site_host);
         if (!partition.n) partition = site_host;
         int64_t now = hk_plat_unix_time();
@@ -478,9 +502,22 @@ static void io_thread(void *arg)
     }
     for (;;) {
         hk_mutex_lock(&l->lock);
-        while (!l->queue_head && !l->stopping) hk_cond_wait(&l->wake, &l->lock);
+        while (!l->queue_head && !l->stopping && !l->swap_pending) hk_cond_wait(&l->wake, &l->lock);
+        if (l->swap_pending) {
+            /* A new filter image: requests already running finished with the old one. */
+            void (*release)(void *) = l->blocker_release;
+            void *ctx = l->blocker_ctx;
+            l->blocker = l->next_blocker;
+            l->blocker_release = l->next_release;
+            l->blocker_ctx = l->next_ctx;
+            l->swap_pending = false;
+            hk_mutex_unlock(&l->lock);
+            if (release) release(ctx);
+            continue;
+        }
         if (l->stopping) {
             hk_mutex_unlock(&l->lock);
+            if (l->blocker_release) l->blocker_release(l->blocker_ctx);
             save_cookies(l);
             hk_cookie_jar_free(&l->jar);
             hk_http_pool_destroy(l->pool);
@@ -508,6 +545,18 @@ hk_loader *hk_loader_create(const hk_blocker *blocker, const char *data_dir)
     return l;
 }
 
+void hk_loader_set_blocker(hk_loader *l, const hk_blocker *b, void (*release)(void *ctx), void *ctx)
+{
+    hk_mutex_lock(&l->lock);
+    if (l->swap_pending && l->next_release) l->next_release(l->next_ctx); /* superseded before use */
+    l->next_blocker = b;
+    l->next_release = release;
+    l->next_ctx = ctx;
+    l->swap_pending = true;
+    hk_cond_signal(&l->wake);
+    hk_mutex_unlock(&l->lock);
+}
+
 void hk_loader_destroy(hk_loader *l)
 {
     if (!l) return;
@@ -529,9 +578,10 @@ void hk_loader_destroy(hk_loader *l)
     hk_free(l, sizeof *l);
 }
 
-static request *new_request(hk_str url, hk_str site, const hk_load_callbacks *cb)
+static request *new_request(hk_str url, hk_str site, uint32_t type, const hk_load_callbacks *cb)
 {
     request *r = hk_alloc_zero(sizeof *r);
+    r->type = type;
     if (site.n) {
         r->site = hk_alloc(site.n + 1);
         memcpy(r->site, site.p, site.n);
@@ -548,15 +598,15 @@ static request *new_request(hk_str url, hk_str site, const hk_load_callbacks *cb
 
 static uint32_t enqueue(hk_loader *l, request *r);
 
-uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, const hk_load_callbacks *cb)
+uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, uint32_t type, const hk_load_callbacks *cb)
 {
-    return enqueue(l, new_request(url, site, cb));
+    return enqueue(l, new_request(url, site, site.n ? type : HK_REQ_DOCUMENT, cb));
 }
 
 uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
                                const hk_load_callbacks *cb)
 {
-    request *r = new_request(url, site, cb);
+    request *r = new_request(url, site, HK_REQ_IMAGE, cb);
     r->image = true;
     r->image_w = max_w;
     r->image_h = max_h;
