@@ -30,6 +30,7 @@ typedef enum hk_status {
     HK_ERR_UNSUPPORTED,
     HK_ERR_NOT_FOUND,
     HK_ERR_LIMIT,
+    HK_ERR_BLOCKED, /* refused by the content blocker or a privacy rule */
 } hk_status;
 
 const char *hk_status_name(hk_status s);

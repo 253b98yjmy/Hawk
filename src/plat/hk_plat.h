@@ -37,6 +37,14 @@ void hk_plat_decode_codepage(uint32_t codepage, const uint8_t *p, size_t n, hk_c
 /* True when b starts a two-byte sequence in a DBCS code page. */
 bool hk_plat_is_lead_byte(uint32_t codepage, uint8_t b);
 
+/* Files (paths are UTF-8). */
+hk_status hk_plat_read_file(const char *path, hk_charbuf *out);
+/* Hawk's per-user data directory (%LOCALAPPDATA%\Hawk), created if missing. */
+bool hk_plat_data_dir(hk_charbuf *out);
+/* Calls fn for each regular file in dir whose name ends with suffix (full UTF-8 paths). */
+void hk_plat_list_files(const char *dir, const char *suffix, void (*fn)(void *user, const char *path),
+                        void *user);
+
 /* Primary language of the user interface is Japanese (decides the legacy encoding fallback). */
 bool hk_plat_locale_is_japanese(void);
 

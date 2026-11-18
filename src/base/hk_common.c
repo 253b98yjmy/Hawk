@@ -16,6 +16,7 @@ const char *hk_status_name(hk_status s)
     case HK_ERR_UNSUPPORTED: return "unsupported";
     case HK_ERR_NOT_FOUND: return "not found";
     case HK_ERR_LIMIT: return "limit exceeded";
+    case HK_ERR_BLOCKED: return "blocked";
     }
     return "unknown";
 }

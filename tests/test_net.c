@@ -105,3 +105,109 @@ HK_TEST(decoder_streaming)
     HK_CHECK_STR(((hk_str){out.data, out.len}), "a\xF0\x9F\x98\x80");
     hk_vec_free(&out);
 }
+
+/* --- blocker ------------------------------------------------------------------------------- */
+
+#include "blocker/hk_blocker.h"
+
+HK_TEST(blocker_hosts)
+{
+    hk_blocker b;
+    hk_blocker_init(&b);
+    uint32_t added = hk_blocker_add_list(&b, HK_STR("! comment\n"
+                                                    "[Adblock Plus 2.0]\n"
+                                                    "||ads.example.com^\n"
+                                                    "@@||ok.ads.example.com^\n"
+                                                    "||Tracker.Example.NET^\r\n"
+                                                    "0.0.0.0 pixel.test # hosts file\n"
+                                                    "127.0.0.1 localhost\n"
+                                                    "||example.org^$third-party\n"
+                                                    "||example.org/path^\n"
+                                                    "##.ad-banner\n"));
+    HK_CHECK_EQ(added, 4);
+    HK_CHECK_EQ(hk_blocker_count(&b), 3);
+    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("ads.example.com")));
+    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("cdn.ads.example.com")));
+    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("ads.example.com.")));
+    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("example.com")));
+    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("badads.example.com")));
+    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("ok.ads.example.com")));
+    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("tracker.example.net")));
+    HK_CHECK(hk_blocker_blocks_host(&b, HK_STR("pixel.test")));
+    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("localhost")));
+    HK_CHECK(!hk_blocker_blocks_host(&b, HK_STR("example.org"))); /* filters with options: later */
+    hk_blocker_free(&b);
+}
+
+/* --- HTTP body decoding ----------------------------------------------------------------------- */
+
+#include "net/hk_http.h"
+
+static bool collect(void *user, const uint8_t *p, size_t n)
+{
+    hk_charbuf_append(user, (const char *)p, n);
+    return true;
+}
+
+/* Feeds input one byte at a time; returns the status and whether the body completed. */
+static hk_status decode_body(hk_http_framing framing, uint64_t length, const char *coding, const uint8_t *in,
+                             size_t n, hk_charbuf *out, bool *done)
+{
+    out->len = 0;
+    *done = false;
+    hk_http_body_decoder *d = hk_http_body_decoder_create(framing, length, hk_str_from_cstr(coding), collect, out);
+    hk_status st = HK_OK;
+    for (size_t i = 0; i < n && st == HK_OK && !*done; i++) st = hk_http_body_decoder_feed(d, in + i, 1, done);
+    if (st == HK_OK && !*done) st = hk_http_body_decoder_finish(d);
+    hk_http_body_decoder_destroy(d);
+    return st;
+}
+
+HK_TEST(http_body_framing)
+{
+    hk_charbuf out = {0};
+    bool done;
+    const char *chunked = "4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-Trailer: y\r\n\r\nGARBAGE";
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_CHUNKED, 0, "", (const uint8_t *)chunked, strlen(chunked), &out, &done),
+                HK_OK);
+    HK_CHECK(done);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "Wikipedia");
+
+    const char *bad = "Z\r\nxx\r\n";
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_CHUNKED, 0, "", (const uint8_t *)bad, strlen(bad), &out, &done),
+                HK_ERR_INVALID);
+
+    const char *body = "abcdefXYZ";
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_LENGTH, 6, "", (const uint8_t *)body, strlen(body), &out, &done), HK_OK);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "abcdef");
+    /* Connection closed before Content-Length bytes arrived. */
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_LENGTH, 20, "", (const uint8_t *)body, strlen(body), &out, &done),
+                HK_ERR_IO);
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_CLOSE, 0, "identity", (const uint8_t *)body, strlen(body), &out, &done),
+                HK_OK);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "abcdefXYZ");
+    hk_vec_free(&out);
+}
+
+HK_TEST(http_body_compression)
+{
+    static const uint8_t k_gzip[] = {0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x0A, 0xCB,
+                                     0x48, 0xCD, 0xC9, 0xC9, 0x57, 0xC8, 0x40, 0x26, 0x13, 0xCB, 0xB3,
+                                     0x01, 0xB3, 0x90, 0x6D, 0x0A, 0x16, 0x00, 0x00, 0x00};
+    static const uint8_t k_zlib[] = {0x78, 0x9C, 0xCB, 0x48, 0xCD, 0xC9, 0xC9, 0x57, 0xC8, 0x40,
+                                     0x26, 0x13, 0xCB, 0xB3, 0x01, 0x5F, 0x5B, 0x08, 0x48};
+    static const uint8_t k_raw[] = {0xCB, 0x48, 0xCD, 0xC9, 0xC9, 0x57, 0xC8, 0x40, 0x26, 0x13, 0xCB, 0xB3, 0x01};
+    hk_charbuf out = {0};
+    bool done;
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_CLOSE, 0, "gzip", k_gzip, sizeof k_gzip, &out, &done), HK_OK);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "hello hello hello hawk");
+    HK_CHECK_EQ(decode_body(HK_HTTP_FRAMING_CLOSE, 0, "deflate", k_zlib, sizeof k_zlib, &out, &done), HK_OK);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "hello hello hello hawk");
+    /* Raw deflate sent as "deflate" (common server mistake): one-byte feeding retried as raw. */
+    hk_http_body_decoder *d = hk_http_body_decoder_create(HK_HTTP_FRAMING_CLOSE, 0, HK_STR("deflate"), collect, &out);
+    out.len = 0;
+    HK_CHECK_EQ(hk_http_body_decoder_feed(d, k_raw, sizeof k_raw, &done), HK_OK);
+    hk_http_body_decoder_destroy(d);
+    HK_CHECK_STR(((hk_str){out.data, out.len}), "hello hello hello hawk");
+    hk_vec_free(&out);
+}

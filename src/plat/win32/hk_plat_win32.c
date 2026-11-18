@@ -7,6 +7,8 @@
 
 #include <windows.h>
 #include <psapi.h>
+
+#include "hk_win32_internal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -84,6 +86,7 @@ void hk_plat_init(void)
     HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, NULL, 0);
 
     QueryPerformanceFrequency(&g_qpc_freq);
+    hk_win32_main_queue_init();
     apply_mitigations();
 }
 

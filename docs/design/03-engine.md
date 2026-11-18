@@ -20,7 +20,7 @@
   - 対象には、adoption agency アルゴリズム、foster parenting、挿入モードのすべてを含む。
   - 実際のサイトの HTML は壊れていることが多く、仕様どおりに直さないと表示が崩れるため。
 - **スクリプト無効（scripting flag = off）で解析する**：`<noscript>` の中身を通常の HTML として扱う。
-- 名前付き文字参照の表は、ビルド時に生成したトライ木として埋め込む（`tools/gen_entities`）。
+- 名前付き文字参照の表は、`tools/gen_entities.py` で生成したソート済み配列として埋め込む（`src/html/hk_html_entities.inc`）。最長一致は、候補の長さを短くしながら二分探索する（名前は最長 32 文字なので十分速い）。
 - `<script>` の中身は解析するが、DOM には保存せず捨てる（メモリ節約）。
 - `<template>` の中身は、描画しない断片として保持するだけにする。
 - **パース中に集めておく情報**（DOM は後から変わらないので、ここで集めれば済む）：
@@ -148,6 +148,8 @@
 - **高 DPI**：Per-Monitor V2 に対応する。CSS の px × DPI 倍率で描画する。
 
 ## 6. テキスト描画とフォント
+
+> **実装上の注意**：DirectWrite のヘッダ（`dwrite.h`）は C++ 専用で、C からは使えない。M2 では `plat/win32` に C++ の薄いラッパ（例外・RTTI・STL なし、C の API だけを公開）を置く。M1 の一時的なテキスト表示は GDI の `DrawTextW` で描いている（`plat/win32/hk_textview_win32.c`、M2 で削除する）。
 
 - **既定のフォント**（設定で変更できる）：
   - sans-serif：Segoe UI → Yu Gothic UI → Meiryo

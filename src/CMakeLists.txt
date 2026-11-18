@@ -28,15 +28,32 @@ target_link_libraries(hk_engine PUBLIC hk_base)
 add_library(hk_plat STATIC
     plat/win32/hk_plat_win32.c
     plat/win32/hk_window_win32.c
+    plat/win32/hk_thread_win32.c
+    plat/win32/hk_conn_win32.c
+    plat/win32/hk_files_win32.c
+    plat/win32/hk_textview_win32.c
 )
-target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz)
+target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32)
+
+# --- third_party/zlib (inflate only) -----------------------------------------
+set(ZLIB_DIR ${PROJECT_SOURCE_DIR}/third_party/zlib)
+add_library(hk_zlib STATIC
+    ${ZLIB_DIR}/adler32.c ${ZLIB_DIR}/crc32.c ${ZLIB_DIR}/inffast.c
+    ${ZLIB_DIR}/inflate.c ${ZLIB_DIR}/inftrees.c ${ZLIB_DIR}/zutil.c
+)
+target_include_directories(hk_zlib PUBLIC ${ZLIB_DIR})
+target_compile_options(hk_zlib PRIVATE /W0 /utf-8)
+target_compile_definitions(hk_zlib PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
 
 # --- net: URLs, encodings, HTTP ----------------------------------------------
 add_library(hk_net STATIC
     net/hk_url.c
     net/hk_encoding.c
+    net/hk_http.c
+    net/hk_loader.c
+    blocker/hk_blocker.c
 )
-target_link_libraries(hk_net PUBLIC hk_base hk_plat)
+target_link_libraries(hk_net PUBLIC hk_base hk_plat PRIVATE hk_zlib)
 
 if(HK_FUZZ)
     return()
@@ -45,10 +62,11 @@ endif()
 # --- hawk.exe ---------------------------------------------------------------
 add_executable(hawk WIN32
     main.c
+    shell/hk_textdoc.c
     plat/win32/hk_entry_win32.c
     plat/win32/hawk.manifest
 )
-target_link_libraries(hawk PRIVATE hk_plat)
+target_link_libraries(hawk PRIVATE hk_engine hk_net hk_plat)
 # wWinMain lives in hk_plat.lib, so the linker cannot infer the Unicode CRT entry point.
 target_link_options(hawk PRIVATE /ENTRY:wWinMainCRTStartup)
 hk_copy_runtime(hawk)
