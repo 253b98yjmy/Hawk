@@ -10,6 +10,7 @@
 #include "base/hk_common.h"
 #include "base/hk_str.h"
 #include "blocker/hk_blocker.h"
+#include "plat/hk_image.h"
 
 typedef struct hk_loader hk_loader;
 
@@ -26,6 +27,8 @@ typedef struct hk_load_callbacks {
     void (*on_data)(void *user, const uint8_t *p, size_t n);
     /* message is a short English description when st != HK_OK. */
     void (*on_done)(void *user, hk_status st, const char *message);
+    /* Image requests only (instead of on_data/on_done): the decoded image, owned by the receiver. */
+    void (*on_image)(void *user, hk_status st, hk_image *img);
 } hk_load_callbacks;
 
 /* blocker may be NULL; it must outlive the loader. */
@@ -35,6 +38,8 @@ void hk_loader_destroy(hk_loader *l);
 
 /* Starts a fetch; returns its id. Main thread only. */
 uint32_t hk_loader_fetch(hk_loader *l, hk_str url, const hk_load_callbacks *cb);
+/* Fetches and decodes an image on the I/O thread, scaled down to fit max_w x max_h (0 = original size). */
+uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, int max_w, int max_h, const hk_load_callbacks *cb);
 /* No further callbacks are made for a cancelled request. Main thread only. */
 void hk_loader_cancel(hk_loader *l, uint32_t id);
 

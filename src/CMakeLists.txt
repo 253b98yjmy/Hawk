@@ -32,8 +32,9 @@ add_library(hk_plat STATIC
     plat/win32/hk_conn_win32.c
     plat/win32/hk_files_win32.c
     plat/win32/hk_text_dwrite.cpp
+    plat/win32/hk_image_wic.c
 )
-target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32 dwrite)
+target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32 dwrite windowscodecs ole32)
 
 # --- css + style: parsing and the cascade ------------------------------------
 add_library(hk_style STATIC

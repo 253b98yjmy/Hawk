@@ -20,6 +20,9 @@ typedef struct request {
     char *url;
     size_t url_len;
     volatile int64_t cancelled;
+    bool image;
+    int image_w, image_h;
+    hk_charbuf body; /* image requests: the whole body (I/O thread) */
 } request;
 
 struct hk_loader {
@@ -46,6 +49,7 @@ typedef struct msg {
     char *bytes; /* URL + '\0' + content type for MSG_RESPONSE; body bytes; or the error text */
     size_t len;
     size_t split;
+    hk_image image; /* MSG_DONE of image requests */
 } msg;
 
 static void remove_live(hk_loader *l, request *r)
@@ -60,6 +64,7 @@ static void remove_live(hk_loader *l, request *r)
 
 static void free_request(request *r)
 {
+    hk_vec_free(&r->body);
     hk_free(r->url, r->url_len + 1);
     hk_free(r, sizeof *r);
 }
@@ -82,10 +87,16 @@ static void deliver(void *arg)
             if (r->cb.on_data) r->cb.on_data(r->cb.user, (const uint8_t *)m->bytes, m->len);
             break;
         case MSG_DONE:
-            if (r->cb.on_done) r->cb.on_done(r->cb.user, m->status, m->bytes ? m->bytes : "");
+            if (r->image) {
+                if (r->cb.on_image) r->cb.on_image(r->cb.user, m->status, &m->image);
+                m->image.pixels = NULL; /* ownership moved to the receiver */
+            } else if (r->cb.on_done) {
+                r->cb.on_done(r->cb.user, m->status, m->bytes ? m->bytes : "");
+            }
             break;
         }
     }
+    hk_image_free(&m->image);
     if (m->kind == MSG_DONE) {
         remove_live(m->loader, r);
         free_request(r);
@@ -151,9 +162,16 @@ static bool on_headers(void *user, const hk_http_response *r)
     return true;
 }
 
+#define MAX_IMAGE_BYTES (32u * 1024 * 1024)
+
 static bool on_body(void *user, const uint8_t *p, size_t n)
 {
     fetch_ctx *f = user;
+    if (f->req->image) {
+        if (f->req->body.len + n > MAX_IMAGE_BYTES) return false;
+        hk_charbuf_append(&f->req->body, (const char *)p, n);
+        return hk_atomic_load64(&f->req->cancelled) == 0;
+    }
     post(f->loader, f->req, MSG_DATA, HK_OK, 0, (const char *)p, n, 0);
     return hk_atomic_load64(&f->req->cancelled) == 0;
 }
@@ -164,8 +182,104 @@ static bool cancelled(void *user)
     return hk_atomic_load64(&f->req->cancelled) != 0;
 }
 
+static void finish_request(hk_loader *l, request *r, hk_status st, const char *err)
+{
+    if (hk_atomic_load64(&r->cancelled)) st = HK_ERR_IO;
+    if (!r->image) {
+        post(l, r, MSG_DONE, st, 0, st == HK_OK ? NULL : err, strlen(err), 0);
+        return;
+    }
+    msg *m = hk_alloc_zero(sizeof *m);
+    m->kind = MSG_DONE;
+    m->loader = l;
+    m->req = r;
+    m->status = st;
+    if (st == HK_OK)
+        m->status = hk_image_decode((const uint8_t *)r->body.data, r->body.len, r->image_w, r->image_h, &m->image);
+    hk_vec_free(&r->body);
+    hk_main_post(deliver, m);
+}
+
+static int b64(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static int hexv(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    c |= 0x20;
+    return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* data: URLs (RFC 2397) are answered without any network access. */
+static void run_data_url(hk_loader *l, request *r)
+{
+    hk_str u = {r->url, r->url_len};
+    size_t comma = hk_str_find_char(u, ',');
+    if (comma == HK_STR_NPOS) {
+        finish_request(l, r, HK_ERR_INVALID, "invalid data: URL");
+        return;
+    }
+    hk_str meta = hk_str_slice(u, 5, comma), payload = hk_str_slice(u, comma + 1, u.n);
+    bool base64 = hk_str_ends_with(meta, HK_STR(";base64"));
+    if (base64) meta.n -= 7;
+    hk_charbuf body = {0};
+    if (base64) {
+        uint32_t acc = 0;
+        int bits = 0;
+        for (size_t i = 0; i < payload.n; i++) {
+            int v = b64((unsigned char)payload.p[i]);
+            if (v < 0) continue; /* whitespace and padding */
+            acc = (acc << 6) | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                hk_charbuf_push(&body, (char)((acc >> bits) & 0xFF));
+            }
+        }
+    } else {
+        for (size_t i = 0; i < payload.n; i++) {
+            int h1 = i + 2 < payload.n ? hexv((unsigned char)payload.p[i + 1]) : -1;
+            int h2 = i + 2 < payload.n ? hexv((unsigned char)payload.p[i + 2]) : -1;
+            if (payload.p[i] == '%' && h1 >= 0 && h2 >= 0) {
+                hk_charbuf_push(&body, (char)(h1 * 16 + h2));
+                i += 2;
+            } else {
+                hk_charbuf_push(&body, payload.p[i]);
+            }
+        }
+    }
+    if (r->image) {
+        hk_vec_free(&r->body);
+        r->body = body;
+        finish_request(l, r, HK_OK, "");
+        return;
+    }
+    size_t shown = r->url_len > 256 ? 256 : r->url_len;
+    hk_charbuf head = {0};
+    hk_charbuf_append(&head, r->url, shown);
+    hk_charbuf_push(&head, 0);
+    if (meta.n) hk_charbuf_append(&head, meta.p, meta.n);
+    else hk_charbuf_append(&head, "text/plain", 10);
+    post(l, r, MSG_RESPONSE, HK_OK, 200, head.data, head.len, shown);
+    if (body.len) post(l, r, MSG_DATA, HK_OK, 0, body.data, body.len, 0);
+    hk_vec_free(&head);
+    hk_vec_free(&body);
+    finish_request(l, r, HK_OK, "");
+}
+
 static void run_request(hk_loader *l, request *r)
 {
+    if (r->url_len > 5 && hk_str_eq_ascii_icase((hk_str){r->url, 5}, HK_STR("data:"))) {
+        run_data_url(l, r);
+        return;
+    }
     hk_arena a;
     hk_arena_init(&a, 0);
     char err[256] = "";
@@ -216,8 +330,7 @@ static void run_request(hk_loader *l, request *r)
         base = &prev;
         current = f.location;
     }
-    if (hk_atomic_load64(&r->cancelled)) st = HK_ERR_IO;
-    post(l, r, MSG_DONE, st, 0, st == HK_OK ? NULL : err, strlen(err), 0);
+    finish_request(l, r, st, err);
     hk_arena_free(&a);
 }
 
@@ -271,15 +384,36 @@ void hk_loader_destroy(hk_loader *l)
     hk_free(l, sizeof *l);
 }
 
-uint32_t hk_loader_fetch(hk_loader *l, hk_str url, const hk_load_callbacks *cb)
+static request *new_request(hk_str url, const hk_load_callbacks *cb)
 {
     request *r = hk_alloc_zero(sizeof *r);
-    r->id = l->next_id++;
     r->cb = *cb;
     r->url = hk_alloc(url.n + 1);
     memcpy(r->url, url.p, url.n);
     r->url[url.n] = 0;
     r->url_len = url.n;
+    return r;
+}
+
+static uint32_t enqueue(hk_loader *l, request *r);
+
+uint32_t hk_loader_fetch(hk_loader *l, hk_str url, const hk_load_callbacks *cb)
+{
+    return enqueue(l, new_request(url, cb));
+}
+
+uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, int max_w, int max_h, const hk_load_callbacks *cb)
+{
+    request *r = new_request(url, cb);
+    r->image = true;
+    r->image_w = max_w;
+    r->image_h = max_h;
+    return enqueue(l, r);
+}
+
+static uint32_t enqueue(hk_loader *l, request *r)
+{
+    r->id = l->next_id++;
     hk_vec_push(&l->live, r);
     hk_mutex_lock(&l->lock);
     if (l->queue_tail) l->queue_tail->next = r;
