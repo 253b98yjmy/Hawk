@@ -31,15 +31,17 @@ typedef struct hk_load_callbacks {
     void (*on_image)(void *user, hk_status st, hk_image *img);
 } hk_load_callbacks;
 
-/* blocker may be NULL; it must outlive the loader. */
-hk_loader *hk_loader_create(const hk_blocker *blocker);
+/* blocker may be NULL; it must outlive the loader. data_dir (may be NULL) holds cookies and the cache. */
+hk_loader *hk_loader_create(const hk_blocker *blocker, const char *data_dir);
 /* Cancels outstanding requests and stops the I/O thread. */
 void hk_loader_destroy(hk_loader *l);
 
-/* Starts a fetch; returns its id. Main thread only. */
-uint32_t hk_loader_fetch(hk_loader *l, hk_str url, const hk_load_callbacks *cb);
+/* Starts a fetch; returns its id. Main thread only. site is the top-level page URL for subresources
+ * (cookies and the cache are partitioned by it) and empty for navigations. */
+uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, const hk_load_callbacks *cb);
 /* Fetches and decodes an image on the I/O thread, scaled down to fit max_w x max_h (0 = original size). */
-uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, int max_w, int max_h, const hk_load_callbacks *cb);
+uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
+                               const hk_load_callbacks *cb);
 /* No further callbacks are made for a cancelled request. Main thread only. */
 void hk_loader_cancel(hk_loader *l, uint32_t id);
 

@@ -4,8 +4,12 @@
 #include "base/hk_log.h"
 #include "base/hk_mem.h"
 #include "base/hk_vec.h"
+#include "net/hk_cache.h"
+#include "net/hk_cookies.h"
 #include "net/hk_http.h"
+#include "net/hk_psl.h"
 #include "net/hk_url.h"
+#include "plat/hk_plat.h"
 #include "plat/hk_thread.h"
 
 #include <stdio.h>
@@ -23,6 +27,8 @@ typedef struct request {
     bool image;
     int image_w, image_h;
     hk_charbuf body; /* image requests: the whole body (I/O thread) */
+    char *site;      /* top-level page URL; NULL for navigations (each hop is its own site) */
+    size_t site_len;
 } request;
 
 struct hk_loader {
@@ -34,6 +40,11 @@ struct hk_loader {
     bool stopping;
     uint32_t next_id;
     HK_VEC(request *) live; /* main thread: requests that have not delivered on_done */
+    /* I/O thread state */
+    char data_dir[512];
+    hk_http_pool *pool;
+    hk_cookie_jar jar;
+    hk_cache *cache;
 };
 
 /* --- messages to the main thread ------------------------------------------------------- */
@@ -64,6 +75,7 @@ static void remove_live(hk_loader *l, request *r)
 
 static void free_request(request *r)
 {
+    if (r->site) hk_free(r->site, r->site_len + 1);
     hk_vec_free(&r->body);
     hk_free(r->url, r->url_len + 1);
     hk_free(r, sizeof *r);
@@ -134,7 +146,25 @@ typedef struct fetch_ctx {
     bool redirect;
     hk_str location;
     hk_arena *arena;
+    const hk_url *target;
+    hk_str site_host;
+    hk_cache_entry *cached; /* entry being revalidated, or NULL */
+    bool not_modified;
+    hk_charbuf capture; /* the body, for the cache */
+    bool capture_ok;
 } fetch_ctx;
+
+#define MAX_CAPTURE (8u * 1024 * 1024)
+
+static void post_response(fetch_ctx *f, int status, hk_str content_type)
+{
+    hk_charbuf b = {0};
+    hk_charbuf_append(&b, f->url, f->url_len);
+    hk_charbuf_push(&b, 0);
+    hk_charbuf_append(&b, content_type.p, content_type.n);
+    post(f->loader, f->req, MSG_RESPONSE, HK_OK, status, b.data, b.len, f->url_len);
+    hk_vec_free(&b);
+}
 
 static bool is_redirect(int status)
 {
@@ -144,6 +174,15 @@ static bool is_redirect(int status)
 static bool on_headers(void *user, const hk_http_response *r)
 {
     fetch_ctx *f = user;
+    int64_t now = hk_plat_unix_time();
+    for (uint32_t i = 0; i < r->headers.len; i++) {
+        if (hk_str_eq_ascii_icase(r->headers.data[i].name, HK_STR("Set-Cookie")))
+            hk_cookie_set(&f->loader->jar, f->target, f->site_host, r->headers.data[i].value, now);
+    }
+    if (r->status == 304 && f->cached) {
+        f->not_modified = true;
+        return false;
+    }
     bool has_location = false;
     hk_str location = hk_http_header_get(r, "Location", &has_location);
     if (is_redirect(r->status) && has_location) {
@@ -151,14 +190,8 @@ static bool on_headers(void *user, const hk_http_response *r)
         f->location = hk_arena_str_dup(f->arena, location);
         return false;
     }
-    hk_str ct = hk_http_header_get(r, "Content-Type", NULL);
-    /* "url\0content-type" in one buffer. */
-    hk_charbuf b = {0};
-    hk_charbuf_append(&b, f->url, f->url_len);
-    hk_charbuf_push(&b, '\0');
-    hk_charbuf_append(&b, ct.p, ct.n);
-    post(f->loader, f->req, MSG_RESPONSE, HK_OK, r->status, b.data, b.len, f->url_len);
-    hk_vec_free(&b);
+    if (!f->req->image) post_response(f, r->status, hk_http_header_get(r, "Content-Type", NULL));
+    f->capture_ok = r->status == 200;
     return true;
 }
 
@@ -172,8 +205,31 @@ static bool on_body(void *user, const uint8_t *p, size_t n)
         hk_charbuf_append(&f->req->body, (const char *)p, n);
         return hk_atomic_load64(&f->req->cancelled) == 0;
     }
+    if (f->capture_ok) {
+        if (f->capture.len + n > MAX_CAPTURE) {
+            f->capture_ok = false;
+            hk_vec_free(&f->capture);
+        } else {
+            hk_charbuf_append(&f->capture, (const char *)p, n);
+        }
+    }
     post(f->loader, f->req, MSG_DATA, HK_OK, 0, (const char *)p, n, 0);
     return hk_atomic_load64(&f->req->cancelled) == 0;
+}
+
+/* Delivers a cached body as if it had been received. */
+static void serve_cached(fetch_ctx *f, const hk_cache_entry *e)
+{
+    if (f->req->image) {
+        hk_vec_free(&f->req->body);
+        hk_charbuf_append(&f->req->body, e->body.data, e->body.len);
+        return;
+    }
+    post_response(f, e->status, hk_str_from_cstr(e->content_type));
+    for (uint32_t off = 0; off < e->body.len; off += 65536) {
+        uint32_t n = e->body.len - off < 65536 ? e->body.len - off : 65536;
+        post(f->loader, f->req, MSG_DATA, HK_OK, 0, e->body.data + off, n, 0);
+    }
 }
 
 static bool cancelled(void *user)
@@ -320,10 +376,65 @@ static void run_request(hk_loader *l, request *r)
             snprintf(err, sizeof err, "blocked by the content blocker: %.*s", (int)url.host.n, url.host.p);
             break;
         }
-        fetch_ctx f = {l, r, url.href.p, url.href.n, false, {0}, &a};
+        /* The top-level site decides cookies and the cache partition. */
+        hk_str site_host = url.host;
+        hk_url site_url;
+        if (r->site && hk_url_parse(&a, (hk_str){r->site, r->site_len}, NULL, &site_url) == HK_OK)
+            site_host = site_url.host;
+        hk_str partition = hk_psl_registrable_domain(site_host);
+        if (!partition.n) partition = site_host;
+        int64_t now = hk_plat_unix_time();
+
+        fetch_ctx f = {0};
+        f.loader = l;
+        f.req = r;
+        f.url = url.href.p;
+        f.url_len = url.href.n;
+        f.arena = &a;
+        f.target = &url;
+        f.site_host = site_host;
+        hk_cache_entry entry;
+        bool have_entry = hk_cache_lookup(l->cache, partition, url.href, &entry);
+        if (have_entry && entry.fresh_until > now) {
+            serve_cached(&f, &entry);
+            hk_cache_entry_free(&entry);
+            st = HK_OK;
+            break;
+        }
+        hk_charbuf extra = {0}, cookie = {0};
+        hk_cookie_header(&l->jar, &url, site_host, r->site == NULL, now, &cookie);
+        if (cookie.len) {
+            hk_charbuf_append(&extra, "Cookie: ", 8);
+            hk_charbuf_append(&extra, cookie.data, cookie.len);
+            hk_charbuf_append(&extra, "\r\n", 2);
+        }
+        if (have_entry && entry.etag[0]) {
+            hk_charbuf_append(&extra, "If-None-Match: ", 15);
+            hk_charbuf_append(&extra, entry.etag, strlen(entry.etag));
+            hk_charbuf_append(&extra, "\r\n", 2);
+        }
+        if (have_entry && entry.last_modified[0]) {
+            hk_charbuf_append(&extra, "If-Modified-Since: ", 19);
+            hk_charbuf_append(&extra, entry.last_modified, strlen(entry.last_modified));
+            hk_charbuf_append(&extra, "\r\n", 2);
+        }
+        if (have_entry) f.cached = &entry;
+        hk_vec_free(&cookie);
         hk_http_callbacks cb = {&f, on_headers, on_body, cancelled};
         hk_http_response resp;
-        st = hk_http_get(&a, &url, &resp, &cb, err, sizeof err);
+        st = hk_http_get(l->pool, &a, &url, (hk_str){extra.data, extra.len}, &resp, &cb, err, sizeof err);
+        hk_vec_free(&extra);
+        if (st == HK_OK && f.not_modified) {
+            serve_cached(&f, &entry);
+            hk_cache_refresh(l->cache, partition, url.href, &resp, &entry, now);
+        } else if (st == HK_OK && resp.status == 200 && !f.redirect) {
+            if (r->image)
+                hk_cache_store(l->cache, partition, url.href, &resp, (const uint8_t *)r->body.data, r->body.len, now);
+            else if (f.capture_ok)
+                hk_cache_store(l->cache, partition, url.href, &resp, (const uint8_t *)f.capture.data, f.capture.len, now);
+        }
+        if (have_entry) hk_cache_entry_free(&entry);
+        hk_vec_free(&f.capture);
         hk_vec_free(&resp.headers);
         if (st != HK_OK || !f.redirect) break;
         prev = url;
@@ -334,14 +445,46 @@ static void run_request(hk_loader *l, request *r)
     hk_arena_free(&a);
 }
 
+static void cookies_path(const hk_loader *l, char *out, size_t n)
+{
+    snprintf(out, n, "%s\\cookies.tsv", l->data_dir);
+}
+
+static void save_cookies(hk_loader *l)
+{
+    if (!l->data_dir[0] || !l->jar.dirty) return;
+    hk_charbuf out = {0};
+    hk_cookie_jar_save(&l->jar, &out, hk_plat_unix_time());
+    char path[600];
+    cookies_path(l, path, sizeof path);
+    if (hk_plat_write_file_atomic(path, out.data ? out.data : "", out.len) == HK_OK) l->jar.dirty = false;
+    hk_vec_free(&out);
+}
+
 static void io_thread(void *arg)
 {
     hk_loader *l = arg;
+    l->pool = hk_http_pool_create(hk_plat_now_ns);
+    hk_cookie_jar_init(&l->jar);
+    if (l->data_dir[0]) {
+        char path[600];
+        cookies_path(l, path, sizeof path);
+        hk_charbuf text = {0};
+        if (hk_plat_read_file(path, &text) == HK_OK)
+            hk_cookie_jar_load(&l->jar, (hk_str){text.data, text.len}, hk_plat_unix_time());
+        hk_vec_free(&text);
+        snprintf(path, sizeof path, "%s\\cache", l->data_dir);
+        l->cache = hk_cache_open(path, 256ull * 1024 * 1024);
+    }
     for (;;) {
         hk_mutex_lock(&l->lock);
         while (!l->queue_head && !l->stopping) hk_cond_wait(&l->wake, &l->lock);
         if (l->stopping) {
             hk_mutex_unlock(&l->lock);
+            save_cookies(l);
+            hk_cookie_jar_free(&l->jar);
+            hk_http_pool_destroy(l->pool);
+            hk_cache_close(l->cache);
             return;
         }
         request *r = l->queue_head;
@@ -349,15 +492,17 @@ static void io_thread(void *arg)
         if (!l->queue_head) l->queue_tail = NULL;
         hk_mutex_unlock(&l->lock);
         run_request(l, r);
+        save_cookies(l);
     }
 }
 
 /* --- public API ----------------------------------------------------------------------------- */
 
-hk_loader *hk_loader_create(const hk_blocker *blocker)
+hk_loader *hk_loader_create(const hk_blocker *blocker, const char *data_dir)
 {
     hk_loader *l = hk_alloc_zero(sizeof *l);
     l->blocker = blocker;
+    if (data_dir) snprintf(l->data_dir, sizeof l->data_dir, "%s", data_dir);
     l->next_id = 1;
     l->thread = hk_thread_start("hawk-io", io_thread, l);
     return l;
@@ -384,9 +529,15 @@ void hk_loader_destroy(hk_loader *l)
     hk_free(l, sizeof *l);
 }
 
-static request *new_request(hk_str url, const hk_load_callbacks *cb)
+static request *new_request(hk_str url, hk_str site, const hk_load_callbacks *cb)
 {
     request *r = hk_alloc_zero(sizeof *r);
+    if (site.n) {
+        r->site = hk_alloc(site.n + 1);
+        memcpy(r->site, site.p, site.n);
+        r->site[site.n] = 0;
+        r->site_len = site.n;
+    }
     r->cb = *cb;
     r->url = hk_alloc(url.n + 1);
     memcpy(r->url, url.p, url.n);
@@ -397,14 +548,15 @@ static request *new_request(hk_str url, const hk_load_callbacks *cb)
 
 static uint32_t enqueue(hk_loader *l, request *r);
 
-uint32_t hk_loader_fetch(hk_loader *l, hk_str url, const hk_load_callbacks *cb)
+uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, const hk_load_callbacks *cb)
 {
-    return enqueue(l, new_request(url, cb));
+    return enqueue(l, new_request(url, site, cb));
 }
 
-uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, int max_w, int max_h, const hk_load_callbacks *cb)
+uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
+                               const hk_load_callbacks *cb)
 {
-    request *r = new_request(url, cb);
+    request *r = new_request(url, site, cb);
     r->image = true;
     r->image_w = max_w;
     r->image_h = max_h;

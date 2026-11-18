@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <string.h>
 #include <wchar.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static const wchar_t *to_wide(hk_arena *a, const char *path)
 {
@@ -79,4 +81,95 @@ void hk_plat_list_files(const char *dir, const char *suffix, void (*fn)(void *us
         FindClose(h);
     }
     hk_arena_free(&a);
+}
+
+hk_status hk_plat_write_file_atomic(const char *path, const char *data, size_t n)
+{
+    hk_arena a;
+    hk_arena_init(&a, 2048);
+    hk_charbuf tmp = {0};
+    hk_charbuf_append(&tmp, path, strlen(path));
+    hk_charbuf_append(&tmp, ".tmp", 5);
+    const wchar_t *wtmp = to_wide(&a, tmp.data);
+    const wchar_t *wpath = to_wide(&a, path);
+    hk_vec_free(&tmp);
+    hk_status st = HK_ERR_IO;
+    HANDLE h = CreateFileW(wtmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        bool ok = n <= 0x7FFFFFFF && WriteFile(h, data, (DWORD)n, &written, NULL) && written == n;
+        ok = ok && FlushFileBuffers(h);
+        CloseHandle(h);
+        if (ok && MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) st = HK_OK;
+        else DeleteFileW(wtmp);
+    }
+    hk_arena_free(&a);
+    return st;
+}
+
+void hk_plat_make_dir(const char *path)
+{
+    hk_arena a;
+    hk_arena_init(&a, 1024);
+    CreateDirectoryW(to_wide(&a, path), NULL);
+    hk_arena_free(&a);
+}
+
+typedef struct file_info {
+    uint64_t size;
+    uint64_t written;
+    wchar_t name[64];
+} file_info;
+
+static int by_age(const void *x, const void *y)
+{
+    const file_info *a = x, *b = y;
+    return a->written < b->written ? -1 : a->written > b->written;
+}
+
+void hk_plat_trim_dir(const char *dir, uint64_t max_bytes, uint64_t target_bytes)
+{
+    hk_arena a;
+    hk_arena_init(&a, 4096);
+    hk_charbuf pattern = {0};
+    hk_charbuf_append(&pattern, dir, strlen(dir));
+    hk_charbuf_append(&pattern, "\\*", 3);
+    const wchar_t *wpat = to_wide(&a, pattern.data);
+    hk_vec_free(&pattern);
+    HK_VEC(file_info) files = {0};
+    uint64_t total = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (wcslen(fd.cFileName) >= 64) continue;
+            file_info fi = {0};
+            fi.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            fi.written = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+            wcscpy_s(fi.name, 64, fd.cFileName);
+            total += fi.size;
+            hk_vec_push(&files, fi);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (total > max_bytes) {
+        qsort(files.data, files.len, sizeof(file_info), by_age);
+        const wchar_t *wdir = to_wide(&a, dir);
+        for (uint32_t i = 0; i < files.len && total > target_bytes; i++) {
+            wchar_t full[MAX_PATH];
+            if (swprintf_s(full, MAX_PATH, L"%s\\%s", wdir, files.data[i].name) > 0 && DeleteFileW(full))
+                total -= files.data[i].size;
+        }
+    }
+    hk_vec_free(&files);
+    hk_arena_free(&a);
+}
+
+int64_t hk_plat_unix_time(void)
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)(t / 10000000ull) - 11644473600ll;
 }

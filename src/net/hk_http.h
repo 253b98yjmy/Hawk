@@ -37,12 +37,19 @@ typedef struct hk_http_callbacks {
 /* The User-Agent Hawk sends (Firefox ESR on Windows; README decision D2). */
 extern const char hk_http_user_agent[];
 
+/* Keep-alive connections, reused across requests (I/O thread only). */
+typedef struct hk_http_pool hk_http_pool;
+hk_http_pool *hk_http_pool_create(uint64_t (*now_ns)(void));
+void hk_http_pool_destroy(hk_http_pool *p);
+
 /*
- * Performs a GET request. Response strings are allocated in the arena. On failure err
- * receives a human-readable message.
+ * Performs a GET request. pool may be NULL (one connection per request). extra_headers are
+ * complete header lines, each ending in CRLF ("Cookie: a=b"). Response strings are allocated
+ * in the arena.
+ * On failure err receives a human-readable message.
  */
-hk_status hk_http_get(hk_arena *a, const hk_url *url, hk_http_response *resp, const hk_http_callbacks *cb,
-                      char *err, size_t errlen);
+hk_status hk_http_get(hk_http_pool *pool, hk_arena *a, const hk_url *url, hk_str extra_headers,
+                      hk_http_response *resp, const hk_http_callbacks *cb, char *err, size_t errlen);
 
 /* Response body decoding, exposed for tests and fuzzing. */
 typedef struct hk_http_body_decoder hk_http_body_decoder;

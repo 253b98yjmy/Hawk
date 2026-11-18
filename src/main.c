@@ -433,7 +433,7 @@ static void request_visible_images(app *a)
         r->node = it->node;
         hk_load_callbacks cb = {r, NULL, NULL, NULL, on_image};
         im->state = IMG_REQUESTED;
-        im->load_id = hk_loader_fetch_image(a->loader, u.href, max_w, max_h, &cb);
+        im->load_id = hk_loader_fetch_image(a->loader, u.href, hk_str_from_cstr(pg->url), max_w, max_h, &cb);
     }
 }
 
@@ -620,7 +620,7 @@ static void start_sheet(app *a, uint32_t index)
 {
     sheet_slot *s = a->page.sheets.data[index];
     hk_load_callbacks cb = {s, NULL, on_sheet_data, on_sheet_done};
-    s->load_id = hk_loader_fetch(a->loader, (hk_str){s->url, s->url_len}, &cb);
+    s->load_id = hk_loader_fetch(a->loader, (hk_str){s->url, s->url_len}, hk_str_from_cstr(a->page.url), &cb);
 }
 
 static hk_str text_content(const hk_document *d, hk_node_id el, hk_charbuf *buf)
@@ -849,7 +849,7 @@ static void navigate(app *a, const char *url, bool push)
     pg->t_start = hk_plat_now_ns();
     hk_window_set_cursor(a->window, HK_CURSOR_WAIT);
     hk_load_callbacks cb = {a, on_response, on_data, on_done};
-    pg->load_id = hk_loader_fetch(a->loader, hk_str_from_cstr(url), &cb);
+    pg->load_id = hk_loader_fetch(a->loader, hk_str_from_cstr(url), HK_STR(""), &cb);
 }
 
 static void go_history(app *a, int delta)
@@ -1049,7 +1049,10 @@ int hk_app_main(int argc, char **argv)
     }
     hk_vec_free(&dir);
 
-    a.loader = hk_loader_create(&a.blocker);
+    hk_charbuf data_dir = {0};
+    if (hk_plat_data_dir(&data_dir)) hk_charbuf_push(&data_dir, 0);
+    a.loader = hk_loader_create(&a.blocker, data_dir.len ? data_dir.data : NULL);
+    hk_vec_free(&data_dir);
     a.painter = hk_painter_create();
     hk_arena_init(&a.page.url_arena, 4096);
 

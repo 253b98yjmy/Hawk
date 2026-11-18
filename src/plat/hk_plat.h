@@ -41,6 +41,13 @@ bool hk_plat_is_lead_byte(uint32_t codepage, uint8_t b);
 hk_status hk_plat_read_file(const char *path, hk_charbuf *out);
 /* Hawk's per-user data directory (%LOCALAPPDATA%\Hawk), created if missing. */
 bool hk_plat_data_dir(hk_charbuf *out);
+/* Writes a file through a temporary file and an atomic replace (a crash leaves the old or the new file). */
+hk_status hk_plat_write_file_atomic(const char *path, const char *data, size_t n);
+void hk_plat_make_dir(const char *path);
+/* If the files in dir use more than max_bytes, deletes the least recently written until target_bytes. */
+void hk_plat_trim_dir(const char *dir, uint64_t max_bytes, uint64_t target_bytes);
+/* Seconds since 1970 (UTC). */
+int64_t hk_plat_unix_time(void);
 /* Calls fn for each regular file in dir whose name ends with suffix (full UTF-8 paths). */
 void hk_plat_list_files(const char *dir, const char *suffix, void (*fn)(void *user, const char *path),
                         void *user);
