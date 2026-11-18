@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "hk_test.h"
 #include "base/hk_mem.h"
+#include "dom/hk_names.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -49,6 +50,7 @@ static int run(const test_case *tc)
 int main(int argc, char **argv)
 {
     int failed = 0, ran = 0;
+    hk_names_init(); /* process-lifetime table, outside the per-test leak check */
     if (argc > 1 && strcmp(argv[1], "--list") == 0) {
         for (size_t i = 0; i < HK_ARRAY_LEN(k_tests); i++) printf("%s\n", k_tests[i].name);
         return 0;

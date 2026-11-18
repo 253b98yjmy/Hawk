@@ -24,6 +24,8 @@ jobs:
         preset: [debug, release]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Build and run tests
         shell: cmd
@@ -48,6 +50,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Build fuzz targets
         shell: cmd
@@ -57,7 +61,7 @@ jobs:
         shell: cmd
         run: |
           mkdir fuzz-artifacts
-          for %%f in (fuzz_utf8 fuzz_atom) do (
+          for %%f in (fuzz_utf8 fuzz_atom fuzz_html) do (
             build\fuzz\fuzz\%%f.exe -max_total_time=60 -print_final_stats=1 -artifact_prefix=fuzz-artifacts\ || exit /b 1
           )
 

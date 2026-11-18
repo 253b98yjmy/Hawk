@@ -4,7 +4,7 @@ add_executable(hk_tests
     test_base.c
     test_utf8.c
 )
-target_link_libraries(hk_tests PRIVATE hk_base)
+target_link_libraries(hk_tests PRIVATE hk_engine)
 target_include_directories(hk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 hk_copy_runtime(hk_tests)
 
@@ -15,6 +15,19 @@ foreach(_line IN LISTS _entries)
     string(REGEX REPLACE "^HK_TEST_ENTRY\\(([A-Za-z0-9_]+)\\).*$" "\\1" _name "${_line}")
     add_test(NAME base.${_name} COMMAND hk_tests ${_name})
 endforeach()
+
+# html5lib-tests tree construction suite.
+add_executable(hk_html5lib_tree html5lib_tree.c)
+target_link_libraries(hk_html5lib_tree PRIVATE hk_engine)
+hk_copy_runtime(hk_html5lib_tree)
+add_test(NAME html5lib.tree
+         COMMAND hk_html5lib_tree ${PROJECT_SOURCE_DIR}/third_party/html5lib-tests/tree-construction)
+
+add_executable(hk_html5lib_tokenizer html5lib_tokenizer.c)
+target_link_libraries(hk_html5lib_tokenizer PRIVATE hk_engine)
+hk_copy_runtime(hk_html5lib_tokenizer)
+add_test(NAME html5lib.tokenizer
+         COMMAND hk_html5lib_tokenizer ${PROJECT_SOURCE_DIR}/third_party/html5lib-tests/tokenizer)
 
 # Launches hawk.exe, waits for the first frame, then closes it.
 add_test(NAME app.smoke COMMAND hawk --smoke)

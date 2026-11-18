@@ -15,6 +15,15 @@ add_library(hk_base STATIC
 target_include_directories(hk_base PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(hk_base PUBLIC hk_options)
 
+# --- engine: DOM and HTML parsing ------------------------------------------------
+add_library(hk_engine STATIC
+    dom/hk_names.c
+    dom/hk_dom.c
+    html/hk_html_tokenizer.c
+    html/hk_html_parser.c
+)
+target_link_libraries(hk_engine PUBLIC hk_base)
+
 if(HK_FUZZ)
     return()
 endif()

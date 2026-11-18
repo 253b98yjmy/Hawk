@@ -1,6 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "base/hk_vec.h"
 
+#include <string.h>
+
+void hk_charbuf_append(hk_charbuf *b, const char *p, size_t n)
+{
+    if (n == 0) return;
+    HK_ASSERT(n <= UINT32_MAX - b->len);
+    hk_vec_reserve(b, (uint64_t)b->len + n);
+    memcpy(b->data + b->len, p, n);
+    b->len += (uint32_t)n;
+}
+
 void *hk_vec_grow_(void *data, uint32_t *cap, size_t elem_size, uint64_t min_cap)
 {
     HK_ASSERT(elem_size > 0);

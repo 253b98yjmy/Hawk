@@ -9,3 +9,5 @@ endfunction()
 
 hk_add_fuzzer(fuzz_utf8 fuzz_utf8.c)
 hk_add_fuzzer(fuzz_atom fuzz_atom.c)
+hk_add_fuzzer(fuzz_html fuzz_html.c)
+target_link_libraries(fuzz_html PRIVATE hk_engine)

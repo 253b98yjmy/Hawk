@@ -40,4 +40,14 @@ void *hk_vec_grow_(void *data, uint32_t *cap, size_t elem_size, uint64_t min_cap
         (v)->len = (v)->cap = 0;                                                                   \
     } while (0)
 
+/* Each HK_VEC(T) spelling is a distinct struct type, so shared element types get a typedef. */
+typedef HK_VEC(char) hk_charbuf;
+
+void hk_charbuf_append(hk_charbuf *b, const char *p, size_t n);
+
+static inline void hk_charbuf_push(hk_charbuf *b, char c)
+{
+    hk_vec_push(b, c);
+}
+
 #endif
