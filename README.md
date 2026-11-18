@@ -1,5 +1,7 @@
 # Hawk
 
+[![CI](https://github.com/253b98yjmy/Hawk/actions/workflows/ci.yml/badge.svg)](https://github.com/253b98yjmy/Hawk/actions/workflows/ci.yml)
+
 C で一から書く、軽量・プライバシー重視の Web ブラウザ（JavaScript なし）。
 設計は [docs/design/](docs/design/README.md) を参照。
 
@@ -25,4 +27,4 @@ scripts\build.cmd fuzz       :: ファジング用の実行ファイルをビル
 
 ## ライセンス
 
-GPL-3.0-or-later
+GPL-3.0-or-later。全文は [LICENSE](LICENSE) を参照。

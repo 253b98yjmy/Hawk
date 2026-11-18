@@ -16,7 +16,17 @@
 - MSVC（または clang-cl）の libFuzzer と ASan を使う（`scripts\build.cmd fuzz`）。対象ごとに、入口となる関数 1 つを用意する（`fuzz/`）。
 - **対象**：HTML のトークナイザとツリー構築、CSS パーサ、URL パーサ、HTTP の応答パーサ、chunked の解析、gzip の展開、文字コードの変換、フィルタのパーサとコンパイラ、filters.bin の読み込み、正規表現、Cookie の解析、`srcset` の解析。
 - **初期コーパス**：html5lib-tests、実サイトから保存したページ、フィルタリスト。
-- ローカルで定期的に実行する。CI を使える場合は、変更のたびに 60 秒ずつ実行する。
+- ローカルで定期的に実行する。CI（`.github/workflows/ci.yml`）では、main への push と pull request のたびに、各ターゲットを 60 秒ずつ実行する。
+
+## 2.1 CI
+
+GitHub Actions の `windows-latest` で、次の 3 つのジョブを並行して実行する。
+
+| ジョブ | 内容 |
+|---|---|
+| `test (debug)` | ASan 付きでビルドし、単体テストと起動テストを実行 |
+| `test (release)` | LTO 付きでビルドし、テストを実行したあと、起動時間とメモリをログに出力 |
+| `fuzz` | ファジング用にビルドし、各ターゲットを 60 秒ずつ実行。クラッシュした入力は成果物（artifact）として保存 |
 
 ## 3. 性能目標
 

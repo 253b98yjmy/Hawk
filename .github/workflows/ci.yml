@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.preset }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run tests
+        shell: cmd
+        run: scripts\build.cmd ${{ matrix.preset }}
+
+      - name: Startup time and memory
+        if: matrix.preset == 'release'
+        shell: cmd
+        run: build\release\src\hawk.exe --smoke
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.preset }}
+          path: build/${{ matrix.preset }}/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  fuzz:
+    name: Fuzz (60 s per target)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build fuzz targets
+        shell: cmd
+        run: scripts\build.cmd fuzz
+
+      - name: Run fuzz targets
+        shell: cmd
+        run: |
+          mkdir fuzz-artifacts
+          for %%f in (fuzz_utf8 fuzz_atom) do (
+            build\fuzz\fuzz\%%f.exe -max_total_time=60 -print_final_stats=1 -artifact_prefix=fuzz-artifacts\ || exit /b 1
+          )
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
