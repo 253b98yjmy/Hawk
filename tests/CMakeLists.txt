@@ -3,8 +3,9 @@ add_executable(hk_tests
     hk_test_main.c
     test_base.c
     test_utf8.c
+    test_net.c
 )
-target_link_libraries(hk_tests PRIVATE hk_engine)
+target_link_libraries(hk_tests PRIVATE hk_engine hk_net)
 target_include_directories(hk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 hk_copy_runtime(hk_tests)
 
@@ -28,6 +29,13 @@ target_link_libraries(hk_html5lib_tokenizer PRIVATE hk_engine)
 hk_copy_runtime(hk_html5lib_tokenizer)
 add_test(NAME html5lib.tokenizer
          COMMAND hk_html5lib_tokenizer ${PROJECT_SOURCE_DIR}/third_party/html5lib-tests/tokenizer)
+
+# WPT URL parsing tests.
+add_executable(hk_url_wpt url_wpt.c)
+target_link_libraries(hk_url_wpt PRIVATE hk_net)
+target_include_directories(hk_url_wpt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+hk_copy_runtime(hk_url_wpt)
+add_test(NAME wpt.url COMMAND hk_url_wpt ${CMAKE_CURRENT_SOURCE_DIR}/data/urltestdata.json)
 
 # Launches hawk.exe, waits for the first frame, then closes it.
 add_test(NAME app.smoke COMMAND hawk --smoke)

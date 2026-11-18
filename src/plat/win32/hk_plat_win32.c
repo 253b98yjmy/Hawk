@@ -2,6 +2,7 @@
 #include "plat/hk_plat.h"
 #include "base/hk_log.h"
 #include "base/hk_utf8.h"
+#include "base/hk_mem.h"
 #include "base/hk_vec.h"
 
 #include <windows.h>
@@ -119,74 +120,151 @@ void hk_plat_mem_info_get(hk_plat_mem_info *out)
     }
 }
 
-/* --- command line -------------------------------------------------------------- */
+/* --- text services ------------------------------------------------------------- */
 
-/*
- * Splits the command line with the MSVC CRT rules (quotes, 2n / 2n+1 backslashes).
- * Avoids CommandLineToArgvW, which would pull shell32.dll into the process.
- */
-static int split_args(hk_arena *a, const wchar_t *cmd, char ***out_argv)
+/* RFC 3492 Punycode encoding of one label (UTF-16, BMP + surrogate pairs), appended to out. */
+static bool punycode_label(const wchar_t *w, int n, wchar_t *out, int cap, int *olen)
 {
-    size_t cmd_len = wcslen(cmd);
-    wchar_t *buf = HK_ARENA_NEW_ARRAY(a, wchar_t, cmd_len + 1);
-    HK_VEC(char *) args = {0};
-
-    const wchar_t *p = cmd;
-    for (;;) {
-        while (*p == L' ' || *p == L'\t') p++;
-        if (!*p) break;
-        size_t n = 0;
-        bool quoted = false;
-        while (*p && (quoted || (*p != L' ' && *p != L'\t'))) {
-            size_t slashes = 0;
-            while (*p == L'\\') {
-                slashes++;
-                p++;
-            }
-            if (*p == L'"') {
-                for (size_t i = 0; i < slashes / 2; i++) buf[n++] = L'\\';
-                if (slashes % 2) {
-                    buf[n++] = L'"';
-                } else if (quoted && p[1] == L'"') {
-                    buf[n++] = L'"'; /* "" inside quotes is a literal quote */
-                    p++;
-                } else {
-                    quoted = !quoted;
-                }
-                p++;
-            } else {
-                for (size_t i = 0; i < slashes; i++) buf[n++] = L'\\';
-                if (*p && (quoted || (*p != L' ' && *p != L'\t'))) buf[n++] = *p++;
-            }
-        }
-        hk_str arg = hk_utf16_to_utf8(a, (const uint16_t *)buf, n);
-        hk_vec_push(&args, (char *)arg.p);
+    enum { BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, INITIAL_BIAS = 72, INITIAL_N = 128 };
+    uint32_t cps[256];
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t c = w[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) c = 0x10000 + ((c - 0xD800) << 10) + (w[++i] - 0xDC00u);
+        if (count == 256) return false;
+        cps[count++] = c;
     }
-
-    char **argv = HK_ARENA_NEW_ARRAY(a, char *, (size_t)args.len + 1);
-    if (args.len) memcpy(argv, args.data, args.len * sizeof(char *));
-    int argc = (int)args.len;
-    hk_vec_free(&args);
-    *out_argv = argv;
-    return argc;
+    int o = *olen;
+#define EMIT(ch)                                                                                   \
+    do {                                                                                           \
+        if (o >= cap) return false;                                                                \
+        out[o++] = (wchar_t)(ch);                                                                  \
+    } while (0)
+    EMIT('x'); EMIT('n'); EMIT('-'); EMIT('-');
+    int basic = 0;
+    for (int i = 0; i < count; i++) {
+        if (cps[i] < 0x80) {
+            EMIT(cps[i]);
+            basic++;
+        }
+    }
+    if (basic) EMIT('-');
+    uint32_t cp = INITIAL_N, delta = 0, bias = INITIAL_BIAS;
+    for (int h = basic; h < count;) {
+        uint32_t m = UINT32_MAX;
+        for (int i = 0; i < count; i++) {
+            if (cps[i] >= cp && cps[i] < m) m = cps[i];
+        }
+        delta += (m - cp) * (uint32_t)(h + 1);
+        cp = m;
+        for (int i = 0; i < count; i++) {
+            if (cps[i] < cp) delta++;
+            if (cps[i] != cp) continue;
+            uint32_t q = delta;
+            for (uint32_t k = BASE;; k += BASE) {
+                uint32_t t = k <= bias ? TMIN : (k >= bias + TMAX ? TMAX : k - bias);
+                if (q < t) break;
+                uint32_t d = t + (q - t) % (BASE - t);
+                EMIT(d < 26 ? 'a' + d : '0' + d - 26);
+                q = (q - t) / (BASE - t);
+            }
+            EMIT(q < 26 ? 'a' + q : '0' + q - 26);
+            /* adapt */
+            uint32_t dl = h == basic ? delta / DAMP : delta / 2;
+            dl += dl / (uint32_t)(h + 1);
+            uint32_t k = 0;
+            while (dl > ((BASE - TMIN) * TMAX) / 2) {
+                dl /= BASE - TMIN;
+                k += BASE;
+            }
+            bias = k + (BASE - TMIN + 1) * dl / (dl + SKEW);
+            delta = 0;
+            h++;
+        }
+        delta++;
+        cp++;
+    }
+#undef EMIT
+    *olen = o;
+    return true;
 }
 
-/* --- entry point ------------------------------------------------------------- */
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd_line, int show)
+bool hk_plat_idna_to_ascii(hk_arena *a, hk_str domain, hk_str *out)
 {
-    HK_UNUSED(instance);
-    HK_UNUSED(prev);
-    HK_UNUSED(cmd_line);
-    HK_UNUSED(show);
-
-    hk_plat_init();
-
-    hk_arena args_arena;
-    hk_arena_init(&args_arena, 4096);
-    char **argv;
-    int argc = split_args(&args_arena, GetCommandLineW(), &argv);
-    int rc = hk_app_main(argc, argv);
-    hk_arena_free(&args_arena);
-    return rc;
+    hk_arena_mark m = hk_arena_get_mark(a);
+    size_t wlen = 0;
+    const wchar_t *w = (const wchar_t *)hk_utf8_to_utf16(a, domain, &wlen);
+    if (wlen == 0 || wlen > 1024) {
+        hk_arena_rewind(a, m);
+        return false;
+    }
+    wchar_t ascii[1024];
+    int n;
+    /*
+     * IdnToAscii applies transitional processing (ß -> ss, ς -> σ), but the URL Standard is
+     * non-transitional. Names with those deviation characters are lowercased, normalized and
+     * Punycode-encoded here (without the remaining UTS #46 validation).
+     */
+    bool deviation = false;
+    for (size_t i = 0; i < wlen; i++) deviation = deviation || w[i] == 0x00DF || w[i] == 0x03C2;
+    if (deviation) {
+        wchar_t lower[1024], nfc[1024];
+        int ln = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, w, (int)wlen, lower,
+                               (int)HK_ARRAY_LEN(lower), NULL, NULL, 0);
+        int nn = ln > 0 ? NormalizeString(NormalizationC, lower, ln, nfc, (int)HK_ARRAY_LEN(nfc)) : 0;
+        n = 0;
+        for (int i = 0, start = 0; nn > 0 && i <= nn; i++) {
+            if (i < nn && nfc[i] != L'.') continue;
+            bool ascii_label = true;
+            for (int k = start; k < i; k++) ascii_label = ascii_label && nfc[k] < 0x80;
+            if (ascii_label) {
+                for (int k = start; k < i && n < (int)HK_ARRAY_LEN(ascii); k++) ascii[n++] = nfc[k];
+            } else if (!punycode_label(nfc + start, i - start, ascii, (int)HK_ARRAY_LEN(ascii), &n)) {
+                n = 0;
+                break;
+            }
+            if (i < nn && n < (int)HK_ARRAY_LEN(ascii)) ascii[n++] = L'.';
+            start = i + 1;
+        }
+    } else {
+        n = IdnToAscii(0, w, (int)wlen, ascii, (int)HK_ARRAY_LEN(ascii));
+    }
+    hk_arena_rewind(a, m);
+    if (n <= 0) return false;
+    char *s = hk_arena_alloc(a, (size_t)n + 1, 1);
+    for (int i = 0; i < n; i++) {
+        if (ascii[i] >= 0x80) return false;
+        s[i] = hk_ascii_lower((char)ascii[i]);
+    }
+    s[n] = 0;
+    *out = (hk_str){s, (size_t)n};
+    return true;
 }
+
+void hk_plat_decode_codepage(uint32_t codepage, const uint8_t *p, size_t n, hk_charbuf *out)
+{
+    if (n == 0) return;
+    HK_ASSERT(n < INT32_MAX / 2);
+    int wn = MultiByteToWideChar(codepage, 0, (const char *)p, (int)n, NULL, 0);
+    if (wn <= 0) return;
+    wchar_t *w = hk_alloc((size_t)wn * sizeof(wchar_t));
+    MultiByteToWideChar(codepage, 0, (const char *)p, (int)n, w, wn);
+    int un = WideCharToMultiByte(CP_UTF8, 0, w, wn, NULL, 0, NULL, NULL);
+    if (un > 0) {
+        hk_vec_reserve(out, (uint64_t)out->len + (uint64_t)un);
+        WideCharToMultiByte(CP_UTF8, 0, w, wn, out->data + out->len, un, NULL, NULL);
+        out->len += (uint32_t)un;
+    }
+    hk_free(w, (size_t)wn * sizeof(wchar_t));
+}
+
+bool hk_plat_is_lead_byte(uint32_t codepage, uint8_t b)
+{
+    return IsDBCSLeadByteEx(codepage, b) != 0;
+}
+
+bool hk_plat_locale_is_japanese(void)
+{
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_JAPANESE;
+}
+
