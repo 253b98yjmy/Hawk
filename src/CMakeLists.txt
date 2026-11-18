@@ -31,9 +31,25 @@ add_library(hk_plat STATIC
     plat/win32/hk_thread_win32.c
     plat/win32/hk_conn_win32.c
     plat/win32/hk_files_win32.c
-    plat/win32/hk_textview_win32.c
+    plat/win32/hk_text_dwrite.cpp
 )
-target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32)
+target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32 dwrite)
+
+# --- css + style: parsing and the cascade ------------------------------------
+add_library(hk_style STATIC
+    css/hk_css_tokenizer.c
+    css/hk_css_parser.c
+    style/hk_css_values.c
+    style/hk_style.c
+)
+target_link_libraries(hk_style PUBLIC hk_engine hk_plat)
+
+# --- layout + paint ------------------------------------------------------------
+add_library(hk_render STATIC
+    layout/hk_layout.c
+    paint/hk_paint.c
+)
+target_link_libraries(hk_render PUBLIC hk_style)
 
 # --- third_party/zlib (inflate only) -----------------------------------------
 set(ZLIB_DIR ${PROJECT_SOURCE_DIR}/third_party/zlib)
@@ -62,11 +78,10 @@ endif()
 # --- hawk.exe ---------------------------------------------------------------
 add_executable(hawk WIN32
     main.c
-    shell/hk_textdoc.c
     plat/win32/hk_entry_win32.c
     plat/win32/hawk.manifest
 )
-target_link_libraries(hawk PRIVATE hk_engine hk_net hk_plat)
+target_link_libraries(hawk PRIVATE hk_render hk_net hk_plat)
 # wWinMain lives in hk_plat.lib, so the linker cannot infer the Unicode CRT entry point.
 target_link_options(hawk PRIVATE /ENTRY:wWinMainCRTStartup)
 hk_copy_runtime(hawk)

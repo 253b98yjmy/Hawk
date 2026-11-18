@@ -25,6 +25,7 @@ struct hk_window {
     bool dirty;
     bool dark;
     bool presented;
+    hk_cursor cursor;
 };
 
 static const wchar_t k_window_class[] = L"HawkWindow";
@@ -157,11 +158,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         break;
-    case WM_KEYDOWN: {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
         hk_key key = HK_KEY_OTHER;
         switch (wp) {
         case VK_UP: key = HK_KEY_UP; break;
         case VK_DOWN: key = HK_KEY_DOWN; break;
+        case VK_LEFT: key = HK_KEY_LEFT; break;
+        case VK_RIGHT: key = HK_KEY_RIGHT; break;
         case VK_PRIOR: key = HK_KEY_PAGE_UP; break;
         case VK_NEXT: key = HK_KEY_PAGE_DOWN; break;
         case VK_HOME: key = HK_KEY_HOME; break;
@@ -169,12 +173,39 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case VK_SPACE: key = HK_KEY_SPACE; break;
         case VK_F5: key = HK_KEY_F5; break;
         case VK_ESCAPE: key = HK_KEY_ESCAPE; break;
+        case VK_BROWSER_BACK: key = HK_KEY_BROWSER_BACK; break;
+        case VK_BROWSER_FORWARD: key = HK_KEY_BROWSER_FORWARD; break;
         default: break;
         }
-        unsigned mods = (GetKeyState(VK_SHIFT) < 0 ? HK_MOD_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? HK_MOD_CTRL : 0);
-        if (key != HK_KEY_OTHER && w->cb.on_key) w->cb.on_key(w->cb.user, w, key, mods);
-        return 0;
+        unsigned mods = (GetKeyState(VK_SHIFT) < 0 ? HK_MOD_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? HK_MOD_CTRL : 0) |
+                        (GetKeyState(VK_MENU) < 0 ? HK_MOD_ALT : 0);
+        if (key != HK_KEY_OTHER && w->cb.on_key) {
+            w->cb.on_key(w->cb.user, w, key, mods);
+            return 0;
+        }
+        break; /* let Alt+F4 and friends reach DefWindowProc */
     }
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_XBUTTONUP: {
+        int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+        hk_mouse_event ev = msg == WM_MOUSEMOVE ? HK_MOUSE_MOVE : msg == WM_LBUTTONDOWN ? HK_MOUSE_DOWN : HK_MOUSE_UP;
+        hk_mouse_button b = HK_BUTTON_NONE;
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) b = HK_BUTTON_LEFT;
+        else if (msg == WM_MBUTTONUP) b = HK_BUTTON_MIDDLE;
+        else if (msg == WM_XBUTTONUP) b = GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? HK_BUTTON_BACK : HK_BUTTON_FORWARD;
+        if (w->cb.on_mouse) w->cb.on_mouse(w->cb.user, w, ev, b, x, y);
+        return msg == WM_XBUTTONUP ? TRUE : 0;
+    }
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            LPCWSTR id = w->cursor == HK_CURSOR_HAND ? IDC_HAND : w->cursor == HK_CURSOR_WAIT ? IDC_APPSTARTING : IDC_ARROW;
+            SetCursor(LoadCursorW(NULL, id));
+            return TRUE;
+        }
+        break;
     case WM_MOUSEWHEEL:
         if (w->cb.on_wheel) w->cb.on_wheel(w->cb.user, w, (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA);
         return 0;
@@ -253,6 +284,14 @@ void hk_window_set_title(hk_window *w, hk_str title)
     hk_arena_init(&tmp, 1024);
     SetWindowTextW(w->hwnd, (const wchar_t *)hk_utf8_to_utf16(&tmp, title, NULL));
     hk_arena_free(&tmp);
+}
+
+void hk_window_set_cursor(hk_window *w, hk_cursor cursor)
+{
+    if (w->cursor == cursor) return;
+    w->cursor = cursor;
+    LPCWSTR id = cursor == HK_CURSOR_HAND ? IDC_HAND : cursor == HK_CURSOR_WAIT ? IDC_APPSTARTING : IDC_ARROW;
+    SetCursor(LoadCursorW(NULL, id));
 }
 
 void hk_window_client_size(const hk_window *w, int *width, int *height)

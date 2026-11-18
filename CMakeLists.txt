@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.25)
-project(Hawk VERSION 0.0.1 LANGUAGES C)
+project(Hawk VERSION 0.0.1 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "Hawk currently builds only on Windows with MSVC (cl) or clang-cl.")
@@ -15,6 +15,10 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+# C++ is used only for the DirectWrite wrapper (dwrite.h has no C interface).
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}") # no exceptions
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Static CRT: no vcruntime DLL dependency.
@@ -23,7 +27,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
 # Options shared by every Hawk target.
 add_library(hk_options INTERFACE)
-target_compile_options(hk_options INTERFACE /W4 /WX /utf-8)
+target_compile_options(hk_options INTERFACE /W4 /WX /utf-8 $<$<COMPILE_LANGUAGE:CXX>:/GR- /D_HAS_EXCEPTIONS=0>)
 target_compile_definitions(hk_options INTERFACE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _WIN32_WINNT=0x0A00 WINVER=0x0A00 PSAPI_VERSION=2)
@@ -35,6 +39,7 @@ if(HK_ASAN)
     add_compile_options(/fsanitize=address)
     set(CMAKE_MSVC_RUNTIME_CHECKS "")
     string(REGEX REPLACE "/RTC[1csu]*" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    string(REGEX REPLACE "/RTC[1csu]*" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
     add_link_options(/INCREMENTAL:NO)
 else()
     # Control Flow Guard (kept off under ASan, which instruments calls itself).

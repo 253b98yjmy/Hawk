@@ -61,7 +61,7 @@ jobs:
         shell: cmd
         run: |
           mkdir fuzz-artifacts
-          for %%f in (fuzz_utf8 fuzz_atom fuzz_html fuzz_net) do (
+          for %%f in (fuzz_utf8 fuzz_atom fuzz_html fuzz_net fuzz_css) do (
             build\fuzz\fuzz\%%f.exe -max_total_time=60 -print_final_stats=1 -artifact_prefix=fuzz-artifacts\ || exit /b 1
           )
 

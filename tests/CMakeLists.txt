@@ -4,8 +4,9 @@ add_executable(hk_tests
     test_base.c
     test_utf8.c
     test_net.c
+    test_css.c
 )
-target_link_libraries(hk_tests PRIVATE hk_engine hk_net)
+target_link_libraries(hk_tests PRIVATE hk_engine hk_net hk_style)
 target_include_directories(hk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 hk_copy_runtime(hk_tests)
 

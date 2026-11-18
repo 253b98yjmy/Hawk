@@ -26,10 +26,36 @@ typedef enum hk_key {
     HK_KEY_SPACE,
     HK_KEY_F5,
     HK_KEY_ESCAPE,
+    HK_KEY_LEFT,
+    HK_KEY_RIGHT,
+    HK_KEY_BROWSER_BACK,
+    HK_KEY_BROWSER_FORWARD,
 } hk_key;
 
 #define HK_MOD_SHIFT 1u
 #define HK_MOD_CTRL 2u
+#define HK_MOD_ALT 4u
+
+typedef enum hk_mouse_event {
+    HK_MOUSE_MOVE,
+    HK_MOUSE_DOWN,
+    HK_MOUSE_UP,
+} hk_mouse_event;
+
+typedef enum hk_mouse_button {
+    HK_BUTTON_NONE,
+    HK_BUTTON_LEFT,
+    HK_BUTTON_MIDDLE,
+    HK_BUTTON_RIGHT,
+    HK_BUTTON_BACK,
+    HK_BUTTON_FORWARD,
+} hk_mouse_button;
+
+typedef enum hk_cursor {
+    HK_CURSOR_ARROW,
+    HK_CURSOR_HAND,
+    HK_CURSOR_WAIT,
+} hk_cursor;
 
 typedef struct hk_window hk_window;
 
@@ -45,6 +71,8 @@ typedef struct hk_window_callbacks {
     void (*on_key)(void *user, hk_window *w, hk_key key, unsigned mods);
     /* Wheel movement in notches (positive = away from the user, i.e. scroll up). */
     void (*on_wheel)(void *user, hk_window *w, float notches);
+    /* Mouse position in physical pixels relative to the client area. */
+    void (*on_mouse)(void *user, hk_window *w, hk_mouse_event ev, hk_mouse_button button, int x, int y);
     /* The window is being destroyed; w is invalid after this returns. */
     void (*on_close)(void *user, hk_window *w);
 } hk_window_callbacks;
@@ -58,6 +86,7 @@ typedef struct hk_window_desc {
 
 hk_status hk_window_create(const hk_window_desc *desc, hk_window **out);
 void hk_window_set_title(hk_window *w, hk_str title);
+void hk_window_set_cursor(hk_window *w, hk_cursor cursor);
 /* Client size in physical pixels. */
 void hk_window_client_size(const hk_window *w, int *width, int *height);
 /* Repaints now and writes the client area to a 32-bit BMP file (tests and debugging). */
