@@ -81,7 +81,7 @@
     X(CLIP_PATH, "clip-path")                                                                      \
     X(OPACITY, "opacity")                                                                          \
     X(VERTICAL_ALIGN, "vertical-align")                                                            \
-    X(CONTENT, "content")
+    X(CONTENT, "content")                                                                              X(TOP, "top")                                                                                      X(RIGHT, "right")                                                                                  X(BOTTOM, "bottom")                                                                                X(LEFT, "left")                                                                                    X(INSET, "inset")                                                                                  X(CLEAR, "clear")                                                                                  X(Z_INDEX, "z-index")                                                                              X(BORDER_COLLAPSE, "border-collapse")                                                              X(BORDER_SPACING, "border-spacing")                                                                X(OVERFLOW_X, "overflow-x")                                                                        X(OVERFLOW_Y, "overflow-y")
 
 typedef enum hk_css_property {
     HK_PROP_NONE_ = 0,

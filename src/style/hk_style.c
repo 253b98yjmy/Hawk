@@ -35,6 +35,8 @@ struct hk_custom_props {
 typedef struct inline_decls {
     const hk_css_decl *d;
     uint32_t n;
+    const hk_css_decl *hints; /* presentational attributes */
+    uint32_t nhints;
     bool parsed;
 } inline_decls;
 
@@ -93,6 +95,7 @@ hk_styler *hk_styler_create(hk_document *doc)
     hk_map64_init(&s->family_cache);
     family_index(s, HK_STR("Segoe UI")); /* index 0: the default family */
     add_sheet(s, (hk_str){k_ua_css, sizeof k_ua_css - 1}, ORIGIN_UA);
+    if (doc->quirks == HK_QUIRKS_FULL) add_sheet(s, (hk_str){k_quirks_css, sizeof k_quirks_css - 1}, ORIGIN_UA);
     return s;
 }
 
@@ -490,6 +493,189 @@ static void consider(const hk_styler *s, const ref_vec *refs, hk_node_id el, mat
     }
 }
 
+/* --- presentational hints (HTML 15.3) --------------------------------------------------------- */
+
+static void put(hk_charbuf *b, const char *s)
+{
+    hk_charbuf_append(b, s, strlen(s));
+}
+
+static void put_str(hk_charbuf *b, hk_str s)
+{
+    /* Attribute text goes into CSS: drop characters that could end the declaration. */
+    for (size_t i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c == ';' || c == '{' || c == '}' || c == '\\' || c == '"' || c == '\'' || c == '<') continue;
+        hk_charbuf_push(b, c);
+    }
+}
+
+static bool all_hex(hk_str v)
+{
+    if (v.n != 3 && v.n != 6) return false;
+    for (size_t i = 0; i < v.n; i++) {
+        char c = hk_ascii_lower(v.p[i]);
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+/* A legacy color attribute value ("ff6600", "#f60", "red"). */
+static void put_color(hk_charbuf *b, hk_str v)
+{
+    v = hk_str_trim_ascii_ws(v);
+    if (all_hex(v)) hk_charbuf_push(b, '#');
+    put_str(b, v);
+}
+
+/* A dimension attribute ("100", "50%", "100px"): unitless numbers are pixels. */
+static bool put_length(hk_charbuf *b, const char *prop, hk_str v)
+{
+    v = hk_str_trim_ascii_ws(v);
+    size_t i = 0;
+    while (i < v.n && ((v.p[i] >= '0' && v.p[i] <= '9') || v.p[i] == '.')) i++;
+    if (i == 0) return false;
+    put(b, prop);
+    put(b, ":");
+    hk_charbuf_append(b, v.p, i);
+    if (i < v.n && v.p[i] == '%') hk_charbuf_push(b, '%');
+    else hk_charbuf_append(b, "px", 2);
+    put(b, ";");
+    return true;
+}
+
+static const hk_attr *attr(const hk_styler *s, hk_node_id el, hk_atom name)
+{
+    return hk_dom_attr(s->doc, el, HK_ATTR_NS_NONE, name);
+}
+
+static hk_node_id ancestor_table(const hk_document *d, hk_node_id el)
+{
+    for (hk_node_id p = hk_dom_node(d, el)->parent; p; p = hk_dom_node(d, p)->parent) {
+        if (hk_dom_node(d, p)->type != HK_NODE_ELEMENT) break;
+        if (hk_dom_is_html(d, p, A(table))) return p;
+    }
+    return HK_NODE_NONE;
+}
+
+static void presentational_hints(const hk_styler *s, hk_node_id el, hk_charbuf *b)
+{
+    const hk_document *d = s->doc;
+    if (hk_dom_node(d, el)->ns != HK_NS_HTML) return;
+    hk_atom n = hk_dom_element(d, el)->name;
+    const hk_attr *a;
+    bool table_part = n == A(table) || n == A(tr) || n == A(td) || n == A(th) || n == A(thead) || n == A(tbody) ||
+                      n == A(tfoot);
+    if ((a = attr(s, el, A(bgcolor))) && (table_part || n == A(body))) {
+        put(b, "background-color:");
+        put_color(b, a->value);
+        put(b, ";");
+    }
+    if (n == A(body) && (a = attr(s, el, A(text)))) {
+        put(b, "color:");
+        put_color(b, a->value);
+        put(b, ";");
+    }
+    if (n == A(font)) {
+        if ((a = attr(s, el, A(color)))) {
+            put(b, "color:");
+            put_color(b, a->value);
+            put(b, ";");
+        }
+        if ((a = attr(s, el, A(face)))) {
+            put(b, "font-family:");
+            put_str(b, a->value);
+            put(b, ";");
+        }
+        if ((a = attr(s, el, A(size)))) {
+            static const char *const k_sizes[] = {"x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"};
+            hk_str v = hk_str_trim_ascii_ws(a->value);
+            int val = 0;
+            bool rel = v.n && (v.p[0] == '+' || v.p[0] == '-');
+            for (size_t i = rel ? 1 : 0; i < v.n && v.p[i] >= '0' && v.p[i] <= '9'; i++) val = val * 10 + (v.p[i] - '0');
+            int size = rel ? (v.p[0] == '+' ? 3 + val : 3 - val) : val;
+            if (size < 1) size = 1;
+            if (size > 7) size = 7;
+            put(b, "font-size:");
+            put(b, k_sizes[size - 1]);
+            put(b, ";");
+        }
+    }
+    if ((a = attr(s, el, A(align)))) {
+        hk_str v = hk_str_trim_ascii_ws(a->value);
+        bool center = hk_str_eq_ascii_icase(v, HK_STR("center")) || hk_str_eq_ascii_icase(v, HK_STR("middle"));
+        bool left = hk_str_eq_ascii_icase(v, HK_STR("left")), right = hk_str_eq_ascii_icase(v, HK_STR("right"));
+        if (n == A(table) || n == A(hr)) {
+            if (center) put(b, "margin-left:auto;margin-right:auto;");
+            else if (left && n == A(table)) put(b, "float:left;");
+            else if (right && n == A(table)) put(b, "float:right;");
+            else if (left) put(b, "margin-right:auto;margin-left:0;");
+            else if (right) put(b, "margin-left:auto;margin-right:0;");
+        } else if (n == A(img) || n == A(iframe) || n == A(object) || n == A(embed)) {
+            if (left) put(b, "float:left;");
+            else if (right) put(b, "float:right;");
+        } else if (center && (n == A(div) || n == A(td) || n == A(th) || n == A(tr) || n == A(thead) ||
+                              n == A(tbody) || n == A(tfoot))) {
+            put(b, "text-align:-webkit-center;");
+        } else if (n == A(div) || n == A(p) || n == A(h1) || n == A(h2) || n == A(h3) || n == A(h4) || n == A(h5) ||
+                   n == A(h6) || n == A(caption) || table_part) {
+            if (center) put(b, "text-align:center;");
+            else if (left) put(b, "text-align:left;");
+            else if (right) put(b, "text-align:right;");
+            else if (hk_str_eq_ascii_icase(v, HK_STR("justify"))) put(b, "text-align:justify;");
+        }
+    }
+    if ((n == A(td) || n == A(th) || n == A(tr)) && (a = attr(s, el, A(valign)))) {
+        put(b, "vertical-align:");
+        put_str(b, a->value);
+        put(b, ";");
+    }
+    bool sized = table_part || n == A(img) || n == A(hr) || n == A(col) || n == A(iframe) || n == A(object) ||
+                 n == A(embed) || n == A(video) || n == A(canvas) || n == A(input);
+    if (sized && n != A(tr) && (a = attr(s, el, A(width)))) put_length(b, "width", a->value);
+    if (sized && n != A(hr) && (a = attr(s, el, A(height)))) put_length(b, "height", a->value);
+    if ((n == A(td) || n == A(th)) && attr(s, el, A(nowrap))) put(b, "white-space:nowrap;");
+    if (n == A(table)) {
+        if ((a = attr(s, el, A(border)))) {
+            hk_str v = hk_str_trim_ascii_ws(a->value);
+            if (!(v.n == 1 && v.p[0] == '0')) {
+                put(b, "border-style:outset;border-color:#808080;");
+                if (!put_length(b, "border-width", v)) put(b, "border-width:1px;");
+            }
+        }
+        if ((a = attr(s, el, A(cellspacing)))) put_length(b, "border-spacing", a->value);
+    }
+    if (n == A(td) || n == A(th)) {
+        hk_node_id table = ancestor_table(d, el);
+        if (table) {
+            if ((a = attr(s, table, A(cellpadding)))) put_length(b, "padding", a->value);
+            const hk_attr *border = attr(s, table, A(border));
+            if (border && !(border->value.n == 1 && border->value.p[0] == '0')) put(b, "border:1px inset #808080;");
+        }
+    }
+    if (n == A(hr)) {
+        if ((a = attr(s, el, A(color)))) {
+            put(b, "border-color:");
+            put_color(b, a->value);
+            put(b, ";background-color:");
+            put_color(b, a->value);
+            put(b, ";");
+        }
+        if (attr(s, el, A(noshade))) put(b, "border-style:solid;");
+        if ((a = attr(s, el, A(size))) && put_length(b, "height", a->value)) put(b, "border-width:0;");
+    }
+    if (n == A(img) || n == A(object)) {
+        if ((a = attr(s, el, A(hspace)))) {
+            put_length(b, "margin-left", a->value);
+            put_length(b, "margin-right", a->value);
+        }
+        if ((a = attr(s, el, A(vspace)))) {
+            put_length(b, "margin-top", a->value);
+            put_length(b, "margin-bottom", a->value);
+        }
+    }
+}
+
 static void collect(hk_styler *s, hk_node_id el, matched_vec *out)
 {
     out->len = 0;
@@ -511,10 +697,16 @@ static void collect(hk_styler *s, hk_node_id el, matched_vec *out)
     inline_decls *in = &s->inline_style.data[el];
     if (!in->parsed) {
         in->parsed = true;
-        hk_atom style_atom = hk_atom_find(&d->atoms, HK_STR("style"));
-        const hk_attr *st = style_atom ? hk_dom_attr(d, el, HK_ATTR_NS_NONE, style_atom) : NULL;
+        const hk_attr *st = hk_dom_attr(d, el, HK_ATTR_NS_NONE, A(style));
         if (st) hk_css_parse_declarations(&s->doc->arena, st->value, &in->d, &in->n);
+        hk_charbuf hints = {0};
+        presentational_hints(s, el, &hints);
+        if (hints.len)
+            hk_css_parse_declarations(&s->doc->arena, (hk_str){hints.data, hints.len}, &in->hints, &in->nhints);
+        hk_vec_free(&hints);
     }
+    /* Presentational hints: author level, specificity zero, before all author rules. */
+    if (in->nhints) add_decls(out, in->hints, in->nhints, ORIGIN_AUTHOR, 0, 0);
     if (in->n) add_decls(out, in->d, in->n, ORIGIN_AUTHOR, 0x3FFFFFFF, 0xFFFFFF);
 
     /* Cascade order: level, then specificity, then source order. */
@@ -688,6 +880,7 @@ static const hk_style k_initial = {
     .max_height = {0, 0, HK_LEN_NONE},
     .min_width = {0, 0, HK_LEN_AUTO},
     .min_height = {0, 0, HK_LEN_AUTO},
+    .inset = {{0, 0, HK_LEN_AUTO}, {0, 0, HK_LEN_AUTO}, {0, 0, HK_LEN_AUTO}, {0, 0, HK_LEN_AUTO}},
 };
 
 static bool kw(hk_cv_span v, const char *k)
@@ -1179,7 +1372,9 @@ static bool apply_decl(apply_ctx *c, uint16_t prop, hk_cv_span v)
     case HK_PROP_TEXT_ALIGN:
         if (kw(v, "left")) st->text_align = HK_ALIGN_LEFT;
         else if (kw(v, "right")) st->text_align = HK_ALIGN_RIGHT;
-        else if (kw(v, "center") || kw(v, "-webkit-center") || kw(v, "-moz-center")) st->text_align = HK_ALIGN_CENTER;
+        else if (kw(v, "center")) st->text_align = HK_ALIGN_CENTER;
+        else if (kw(v, "-webkit-center") || kw(v, "-moz-center") || kw(v, "-khtml-center"))
+            st->text_align = HK_ALIGN_LEGACY_CENTER;
         else if (kw(v, "justify")) st->text_align = HK_ALIGN_JUSTIFY;
         else if (kw(v, "start")) st->text_align = HK_ALIGN_START;
         else if (kw(v, "end")) st->text_align = HK_ALIGN_END;
@@ -1239,11 +1434,60 @@ static bool apply_decl(apply_ctx *c, uint16_t prop, hk_cv_span v)
     case HK_PROP_OVERFLOW:
         st->overflow_hidden = (uint8_t)(!kw(v, "visible"));
         return true;
+    case HK_PROP_TOP:
+    case HK_PROP_RIGHT:
+    case HK_PROP_BOTTOM:
+    case HK_PROP_LEFT:
+        if (!hk_cv_length(v, &c->cv, HK_CV_PERCENT | HK_CV_AUTO | HK_CV_NEGATIVE, &l)) return false;
+        st->inset[prop - HK_PROP_TOP] = l;
+        return true;
+    case HK_PROP_INSET: {
+        hk_cv_span s4[4];
+        if (!four(v, s4)) return false;
+        hk_length in[4];
+        for (int i = 0; i < 4; i++) {
+            if (!hk_cv_length(s4[i], &c->cv, HK_CV_PERCENT | HK_CV_AUTO | HK_CV_NEGATIVE, &in[i])) return false;
+        }
+        memcpy(st->inset, in, sizeof in);
+        return true;
+    }
+    case HK_PROP_CLEAR:
+        if (kw(v, "none")) st->clear = 0;
+        else if (kw(v, "left") || kw(v, "inline-start")) st->clear = 1;
+        else if (kw(v, "right") || kw(v, "inline-end")) st->clear = 2;
+        else if (kw(v, "both")) st->clear = 3;
+        else return false;
+        return true;
+    case HK_PROP_Z_INDEX:
+        if (kw(v, "auto")) st->z_index = 0;
+        else if (hk_cv_number(v, &c->cv, &f)) st->z_index = (int32_t)f;
+        else return false;
+        return true;
+    case HK_PROP_BORDER_COLLAPSE:
+        if (kw(v, "collapse")) st->border_collapse = 1;
+        else if (kw(v, "separate")) st->border_collapse = 0;
+        else return false;
+        return true;
+    case HK_PROP_BORDER_SPACING: {
+        hk_cv_span p2[2];
+        if (hk_cv_split(v, p2, 2) == 0 || !hk_cv_length(p2[0], &c->cv, 0, &l)) return false;
+        st->border_spacing = l.px;
+        return true;
+    }
+    case HK_PROP_VERTICAL_ALIGN:
+        if (kw(v, "top") || kw(v, "text-top")) st->valign = 1;
+        else if (kw(v, "middle")) st->valign = 2;
+        else if (kw(v, "bottom") || kw(v, "text-bottom")) st->valign = 3;
+        else st->valign = 0;
+        return true;
+    case HK_PROP_OVERFLOW_X:
+    case HK_PROP_OVERFLOW_Y:
+        if (!kw(v, "visible")) st->overflow_hidden = 1;
+        return true;
     case HK_PROP_CLIP:
     case HK_PROP_CLIP_PATH:
     case HK_PROP_OPACITY:
-    case HK_PROP_VERTICAL_ALIGN:
-    case HK_PROP_CONTENT: return true; /* parsed for the "visually hidden" heuristic only */
+    case HK_PROP_CONTENT: return true;
     default: return false;
     }
 }

@@ -70,9 +70,19 @@ typedef struct hk_text_rect {
     uint32_t user;
 } hk_text_rect;
 
-/* Emits the glyph runs and decoration rectangles (underlines). Glyph arrays are heap-allocated. */
-void hk_text_layout_runs(hk_text_layout *l, void (*on_run)(void *user, const hk_glyph_run *r),
-                         void (*on_rect)(void *user, const hk_text_rect *r), void *user);
+/* Reserves a w x h box at text position pos (the text must hold U+FFFC there). baseline is the
+ * distance from the box top to its baseline. user identifies the box in hk_text_sink.box. */
+void hk_text_layout_set_inline_box(hk_text_layout *l, uint32_t pos, float w, float h, float baseline, uint32_t user);
+
+typedef struct hk_text_sink {
+    void *user;
+    /* Glyph arrays are heap-allocated and owned by the receiver. */
+    void (*run)(void *user, const hk_glyph_run *r);
+    void (*rect)(void *user, const hk_text_rect *r); /* underlines and strike-throughs */
+    void (*box)(void *user, float x, float y, uint32_t box_user); /* top-left of an inline box */
+} hk_text_sink;
+
+void hk_text_layout_emit(hk_text_layout *l, const hk_text_sink *sink);
 /* Rectangles covering a text range (for links). */
 void hk_text_layout_range_rects(hk_text_layout *l, uint32_t start, uint32_t len,
                                 void (*on_rect)(void *user, const hk_text_rect *r), void *user);

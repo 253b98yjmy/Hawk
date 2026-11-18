@@ -84,11 +84,68 @@ class Effect : public IUnknown {
 };
 
 struct EmitCtx {
-    void (*on_run)(void *, const hk_glyph_run *);
-    void (*on_rect)(void *, const hk_text_rect *);
-    void *user;
+    const hk_text_sink *sink;
     uint32_t default_color;
 };
+
+// A reserved box inside a line (inline-block, image, form control).
+class InlineBox : public IDWriteInlineObject {
+  public:
+    InlineBox(float w, float h, float baseline, uint32_t user) : refs_(1), w_(w), h_(h), baseline_(baseline), user(user) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **out) override
+    {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDWriteInlineObject)) {
+            *out = this;
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG r = --refs_;
+        if (!r) {
+            this->~InlineBox();
+            hk_free(this, sizeof *this);
+        }
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE Draw(void *ctx, IDWriteTextRenderer *renderer, FLOAT x, FLOAT y, BOOL, BOOL, IUnknown *) override;
+    HRESULT STDMETHODCALLTYPE GetMetrics(DWRITE_INLINE_OBJECT_METRICS *m) override
+    {
+        m->width = w_;
+        m->height = h_;
+        m->baseline = baseline_;
+        m->supportsSideways = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetOverhangMetrics(DWRITE_OVERHANG_METRICS *m) override
+    {
+        m->left = m->top = m->right = m->bottom = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBreakConditions(DWRITE_BREAK_CONDITION *before, DWRITE_BREAK_CONDITION *after) override
+    {
+        *before = *after = DWRITE_BREAK_CONDITION_NEUTRAL;
+        return S_OK;
+    }
+
+  private:
+    ULONG refs_;
+    float w_, h_, baseline_;
+
+  public:
+    uint32_t user;
+};
+
+HRESULT STDMETHODCALLTYPE InlineBox::Draw(void *ctx, IDWriteTextRenderer *, FLOAT x, FLOAT y, BOOL, BOOL, IUnknown *)
+{
+    EmitCtx *c = static_cast<EmitCtx *>(ctx);
+    if (c && c->sink->box) c->sink->box(c->sink->user, x, y, user);
+    return S_OK;
+}
 
 class Renderer : public IDWriteTextRenderer {
   public:
@@ -123,7 +180,7 @@ class Renderer : public IDWriteTextRenderer {
     HRESULT STDMETHODCALLTYPE DrawGlyphRun(void *, FLOAT x, FLOAT y, DWRITE_MEASURING_MODE, const DWRITE_GLYPH_RUN *run,
                                            const DWRITE_GLYPH_RUN_DESCRIPTION *, IUnknown *effect) override
     {
-        if (!c_->on_run || run->glyphCount == 0) return S_OK;
+        if (!c_->sink->run || run->glyphCount == 0) return S_OK;
         hk_glyph_run r = {};
         r.face = run->fontFace;
         run->fontFace->AddRef();
@@ -144,7 +201,7 @@ class Renderer : public IDWriteTextRenderer {
         Effect *e = static_cast<Effect *>(effect);
         r.color = e ? e->color : c_->default_color;
         r.user = e ? e->user : 0;
-        c_->on_run(c_->user, &r);
+        c_->sink->run(c_->sink->user, &r);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DrawUnderline(void *, FLOAT x, FLOAT y, const DWRITE_UNDERLINE *u, IUnknown *effect) override
@@ -156,18 +213,19 @@ class Renderer : public IDWriteTextRenderer {
     {
         return rect(x, y + s->offset, s->width, s->thickness, effect);
     }
-    HRESULT STDMETHODCALLTYPE DrawInlineObject(void *, FLOAT, FLOAT, IDWriteInlineObject *, BOOL, BOOL, IUnknown *) override
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(void *, FLOAT x, FLOAT y, IDWriteInlineObject *obj, BOOL sideways,
+                                               BOOL rtl, IUnknown *effect) override
     {
-        return S_OK;
+        return obj->Draw(c_, this, x, y, sideways, rtl, effect);
     }
 
   private:
     HRESULT rect(float x, float y, float w, float h, IUnknown *effect)
     {
-        if (!c_->on_rect) return S_OK;
+        if (!c_->sink->rect) return S_OK;
         Effect *e = static_cast<Effect *>(effect);
         hk_text_rect r = {x, y, w, h < 1 ? 1 : h, e ? e->color : c_->default_color, e ? e->user : 0};
-        c_->on_rect(c_->user, &r);
+        c_->sink->rect(c_->sink->user, &r);
         return S_OK;
     }
     EmitCtx *c_;
@@ -267,10 +325,18 @@ void hk_text_layout_intrinsic(hk_text_layout *l, float *min_width, float *max_wi
     *max_width = m.widthIncludingTrailingWhitespace;
 }
 
-void hk_text_layout_runs(hk_text_layout *l, void (*on_run)(void *, const hk_glyph_run *),
-                         void (*on_rect)(void *, const hk_text_rect *), void *user)
+void hk_text_layout_set_inline_box(hk_text_layout *l, uint32_t pos, float w, float h, float baseline, uint32_t user)
 {
-    EmitCtx c = {on_run, on_rect, user, l->default_color};
+    void *mem = hk_alloc(sizeof(InlineBox));
+    InlineBox *b = new (mem) InlineBox(w, h, baseline, user);
+    DWRITE_TEXT_RANGE r = {pos, 1};
+    l->layout->SetInlineObject(b, r);
+    b->Release();
+}
+
+void hk_text_layout_emit(hk_text_layout *l, const hk_text_sink *sink)
+{
+    EmitCtx c = {sink, l->default_color};
     Renderer r(&c);
     l->layout->Draw(nullptr, &r, 0, 0);
 }

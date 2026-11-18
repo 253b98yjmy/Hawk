@@ -16,8 +16,12 @@ void hk_painter_destroy(hk_painter *p);
 /* Drops cached glyph masks (e.g. when fonts are released with a display list). */
 void hk_painter_clear_cache(hk_painter *p);
 
+/* Decoded image pixels (straight ARGB, 0xAARRGGBB) for an <img>, or false when not available yet. */
+typedef bool (*hk_paint_image_fn)(void *user, hk_node_id img, const uint32_t **pixels, int *w, int *h);
+
 /* Paints the part of the document starting at scroll_y (CSS px) at the given device scale. */
-void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale);
+void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale,
+              hk_paint_image_fn image, void *image_user);
 
 /* Bytes held by the glyph cache. */
 size_t hk_painter_cache_bytes(const hk_painter *p);

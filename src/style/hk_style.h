@@ -42,7 +42,8 @@ typedef struct hk_length {
 } hk_length;
 
 typedef enum { HK_POS_STATIC, HK_POS_RELATIVE, HK_POS_ABSOLUTE, HK_POS_FIXED, HK_POS_STICKY } hk_position;
-typedef enum { HK_ALIGN_START, HK_ALIGN_LEFT, HK_ALIGN_RIGHT, HK_ALIGN_CENTER, HK_ALIGN_JUSTIFY, HK_ALIGN_END } hk_text_align;
+/* LEGACY_CENTER (-webkit-center, <center>, align=center) also centers block-level children. */
+typedef enum { HK_ALIGN_START, HK_ALIGN_LEFT, HK_ALIGN_RIGHT, HK_ALIGN_CENTER, HK_ALIGN_JUSTIFY, HK_ALIGN_END, HK_ALIGN_LEGACY_CENTER } hk_text_align;
 typedef enum { HK_WS_NORMAL, HK_WS_NOWRAP, HK_WS_PRE, HK_WS_PRE_WRAP, HK_WS_PRE_LINE } hk_white_space;
 typedef enum { HK_LIST_NONE, HK_LIST_DISC, HK_LIST_CIRCLE, HK_LIST_SQUARE, HK_LIST_DECIMAL } hk_list_style;
 typedef enum { HK_BORDER_NONE, HK_BORDER_SOLID, HK_BORDER_DASHED, HK_BORDER_DOTTED, HK_BORDER_DOUBLE } hk_border_style;
@@ -80,13 +81,18 @@ typedef struct hk_style {
     uint8_t border_box;
     uint8_t overflow_hidden;
     uint8_t border_style[4];
-    uint8_t pad1_[3];
+    uint8_t clear;           /* 1 left, 2 right, 3 both */
+    uint8_t border_collapse;
+    uint8_t valign;          /* 0 baseline, 1 top, 2 middle, 3 bottom (table cells) */
     uint32_t background;
     uint32_t border_color[4];
     float border_width[4]; /* top, right, bottom, left; 0 when the style is none */
     hk_length margin[4];
     hk_length padding[4];
     hk_length width, height, min_width, max_width, min_height, max_height;
+    hk_length inset[4]; /* top, right, bottom, left; auto by default */
+    float border_spacing;
+    int32_t z_index;
 } hk_style;
 
 typedef struct hk_styler hk_styler;

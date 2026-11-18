@@ -189,7 +189,7 @@ static void relayout(app *a)
     hk_styler_compute(pg->styler, &env);
     hk_display_list_free(&pg->dl);
     hk_painter_clear_cache(a->painter);
-    hk_layout_document(pg->doc, pg->styler, w, &pg->dl);
+    hk_layout_document(pg->doc, pg->styler, w, h, NULL, &pg->dl);
     pg->layout_width = w;
     pg->laid_out = true;
     float max = pg->dl.height - h;
@@ -625,7 +625,7 @@ static void on_paint(void *user, hk_window *w, hk_surface *s)
     app *a = user;
     page *pg = &a->page;
     if (pg->laid_out) {
-        hk_paint(a->painter, &pg->dl, s, a->scroll, hk_window_scale(w));
+        hk_paint(a->painter, &pg->dl, s, a->scroll, hk_window_scale(w), NULL, NULL);
         return;
     }
     for (int y = 0; y < s->height; y++) {
@@ -714,7 +714,7 @@ static void on_mouse(void *user, hk_window *w, hk_mouse_event ev, hk_mouse_butto
     }
     if (!a->page.laid_out) return;
     float scale = hk_window_scale(w);
-    hk_node_id link = hk_display_list_link_at(&a->page.dl, (float)x / scale, (float)y / scale + a->scroll);
+    hk_node_id link = hk_display_list_link_at(&a->page.dl, (float)x / scale, (float)y / scale, a->scroll);
     if (ev == HK_MOUSE_MOVE) {
         if (!a->page.loading) hk_window_set_cursor(w, link ? HK_CURSOR_HAND : HK_CURSOR_ARROW);
         a->hover_link = link;

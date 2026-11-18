@@ -115,47 +115,117 @@ static void fill_rect(hk_surface *s, int x0, int y0, int x1, int y1, uint32_t co
     }
 }
 
-static void draw_mask(hk_surface *s, const cached_glyph *g, int px, int py, uint32_t color)
-{
-    int x0 = px + g->left, y0 = py + g->top;
-    for (int j = 0; j < g->h; j++) {
-        int y = y0 + j;
-        if (y < 0 || y >= s->height) continue;
-        uint32_t *row = s->pixels + (size_t)y * (size_t)s->stride;
-        const uint8_t *src = g->alpha + (size_t)j * (size_t)g->w;
-        for (int i = 0; i < g->w; i++) {
-            int x = x0 + i;
-            if (x < 0 || x >= s->width || !src[i]) continue;
-            row[x] = blend(row[x], color, src[i]);
-        }
-    }
-}
-
 static int snap(float v)
 {
     return (int)floorf(v + 0.5f);
 }
 
-void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale)
+typedef struct clip {
+    int x0, y0, x1, y1;
+} clip;
+
+static void fill_clipped(hk_surface *s, const clip *c, int x0, int y0, int x1, int y1, uint32_t color)
 {
-    fill_rect(s, 0, 0, s->width, s->height, dl->canvas | 0xFF000000u);
-    float view_top = scroll_y, view_bottom = scroll_y + (float)s->height / scale;
+    if (x0 < c->x0) x0 = c->x0;
+    if (y0 < c->y0) y0 = c->y0;
+    if (x1 > c->x1) x1 = c->x1;
+    if (y1 > c->y1) y1 = c->y1;
+    fill_rect(s, x0, y0, x1, y1, color);
+}
+
+static void draw_mask_clipped(hk_surface *s, const clip *c, const cached_glyph *g, int px, int py, uint32_t color)
+{
+    int x0 = px + g->left, y0 = py + g->top;
+    for (int j = 0; j < g->h; j++) {
+        int y = y0 + j;
+        if (y < c->y0 || y >= c->y1) continue;
+        uint32_t *row = s->pixels + (size_t)y * (size_t)s->stride;
+        const uint8_t *src = g->alpha + (size_t)j * (size_t)g->w;
+        for (int i = 0; i < g->w; i++) {
+            int x = x0 + i;
+            if (x < c->x0 || x >= c->x1 || !src[i]) continue;
+            row[x] = blend(row[x], color, src[i]);
+        }
+    }
+}
+
+/* Scales an image into the device rectangle (bilinear when shrinking little, nearest otherwise). */
+static void draw_image(hk_surface *s, const clip *c, int x0, int y0, int x1, int y1, const uint32_t *px, int pw, int ph)
+{
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0 || pw <= 0 || ph <= 0) return;
+    int cx0 = x0 < c->x0 ? c->x0 : x0, cy0 = y0 < c->y0 ? c->y0 : y0;
+    int cx1 = x1 > c->x1 ? c->x1 : x1, cy1 = y1 > c->y1 ? c->y1 : y1;
+    for (int y = cy0; y < cy1; y++) {
+        int sy = (int)(((int64_t)(y - y0) * ph) / h);
+        if (sy >= ph) sy = ph - 1;
+        uint32_t *row = s->pixels + (size_t)y * (size_t)s->stride;
+        const uint32_t *src = px + (size_t)sy * (size_t)pw;
+        for (int x = cx0; x < cx1; x++) {
+            int sx = (int)(((int64_t)(x - x0) * pw) / w);
+            if (sx >= pw) sx = pw - 1;
+            uint32_t v = src[sx];
+            uint32_t a = v >> 24;
+            if (a == 255) row[x] = v;
+            else if (a) row[x] = blend(row[x], v | 0xFF000000u, a);
+        }
+    }
+}
+
+static void paint_pass(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale,
+                       hk_paint_image_fn image, void *image_user, bool fixed_pass)
+{
+    float scroll = fixed_pass ? 0 : scroll_y;
+    float view_top = scroll, view_bottom = scroll + (float)s->height / scale;
+    clip stack[64];
+    int depth = 0;
+    stack[0] = (clip){0, 0, s->width, s->height};
+    int skipped_clips = 0; /* clips opened by items of the other pass */
     for (uint32_t i = 0; i < dl->items.len; i++) {
         const hk_item *it = &dl->items.data[i];
+        if ((it->fixed != 0) != fixed_pass) {
+            if (it->kind == HK_ITEM_CLIP) skipped_clips++;
+            else if (it->kind == HK_ITEM_UNCLIP && skipped_clips) skipped_clips--;
+            continue;
+        }
+        const clip *cl = &stack[depth];
+        if (it->kind == HK_ITEM_CLIP) {
+            clip n = {snap(it->x * scale), snap((it->y - scroll) * scale), snap((it->x + it->w) * scale),
+                      snap((it->y + it->h - scroll) * scale)};
+            if (n.x0 < cl->x0) n.x0 = cl->x0;
+            if (n.y0 < cl->y0) n.y0 = cl->y0;
+            if (n.x1 > cl->x1) n.x1 = cl->x1;
+            if (n.y1 > cl->y1) n.y1 = cl->y1;
+            if (depth < 63) stack[++depth] = n;
+            continue;
+        }
+        if (it->kind == HK_ITEM_UNCLIP) {
+            if (depth > 0) depth--;
+            continue;
+        }
         if (it->y > view_bottom || it->y + it->h < view_top) continue;
+        if (cl->x0 >= cl->x1 || cl->y0 >= cl->y1) continue;
         if (it->kind == HK_ITEM_RECT) {
             if ((it->color >> 24) == 0) continue;
-            int x0 = snap(it->x * scale), y0 = snap((it->y - scroll_y) * scale);
-            int x1 = snap((it->x + it->w) * scale), y1 = snap((it->y + it->h - scroll_y) * scale);
-            if (x1 == x0 && it->w > 0) x1 = x0 + 1; /* hairlines stay visible */
+            int x0 = snap(it->x * scale), y0 = snap((it->y - scroll) * scale);
+            int x1 = snap((it->x + it->w) * scale), y1 = snap((it->y + it->h - scroll) * scale);
+            if (x1 == x0 && it->w > 0) x1 = x0 + 1;
             if (y1 == y0 && it->h > 0) y1 = y0 + 1;
-            fill_rect(s, x0, y0, x1, y1, it->color);
+            fill_clipped(s, cl, x0, y0, x1, y1, it->color);
+            continue;
+        }
+        if (it->kind == HK_ITEM_IMAGE) {
+            const uint32_t *px;
+            int pw, ph;
+            if (image && image(image_user, it->node, &px, &pw, &ph))
+                draw_image(s, cl, snap(it->x * scale), snap((it->y - scroll) * scale), snap((it->x + it->w) * scale),
+                           snap((it->y + it->h - scroll) * scale), px, pw, ph);
             continue;
         }
         const hk_glyph_run *r = &it->run;
         float size = r->size * scale;
         float pen = r->x;
-        float base = (r->baseline - scroll_y) * scale;
+        float base = (r->baseline - scroll) * scale;
         for (uint32_t k = 0; k < r->count; k++) {
             float adv = r->advances[k];
             float gx = (r->rtl ? pen - adv - r->offsets[2 * k] : pen + r->offsets[2 * k]) * scale;
@@ -164,8 +234,16 @@ void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scr
             int frac = (int)((gx - (float)ix) * SUBPIXEL);
             if (frac >= SUBPIXEL) frac = SUBPIXEL - 1;
             const cached_glyph *g = glyph(p, r->face, size, r->glyphs[k], frac);
-            if (g->alpha) draw_mask(s, g, ix, snap(gy), r->color);
+            if (g->alpha) draw_mask_clipped(s, cl, g, ix, snap(gy), r->color);
             pen += r->rtl ? -adv : adv;
         }
     }
+}
+
+void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale,
+              hk_paint_image_fn image, void *image_user)
+{
+    fill_rect(s, 0, 0, s->width, s->height, dl->canvas | 0xFF000000u);
+    paint_pass(p, dl, s, scroll_y, scale, image, image_user, false);
+    paint_pass(p, dl, s, scroll_y, scale, image, image_user, true);
 }

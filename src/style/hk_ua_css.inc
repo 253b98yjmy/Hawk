@@ -4,7 +4,7 @@ static const char k_ua_css[] =
     " legend, listing, main, p, plaintext, pre, search, xmp, details, summary, article, aside, h1, h2, h3,"
     " h4, h5, h6, hgroup, nav, section, dir, dd, dl, dt, menu, ol, ul, fieldset, optgroup { display: block; }\n"
     "li { display: list-item; }\n"
-    "table { display: table; }\n"
+    "table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box; }\n"
     "caption { display: table-caption; text-align: center; }\n"
     "thead, tbody, tfoot { display: table-row-group; }\n"
     "tr { display: table-row; }\n"
@@ -13,7 +13,7 @@ static const char k_ua_css[] =
     "colgroup, col { display: none; }\n"
     "area, base, basefont, datalist, head, link, meta, noembed, noframes, param, rp, script, style,"
     " template, title, [hidden], iframe, frame, frameset, object, embed, video, audio, canvas, svg, math,"
-    " input[type=hidden], dialog:not([open]), select, button, input, textarea, img { display: none; }\n"
+    " input[type=hidden], dialog:not([open]), select, button, input, textarea, source, track { display: none; }\n"
     "body { margin: 8px; }\n"
     "p, blockquote, figure, listing, plaintext, pre, xmp, dl, menu, dir, ol, ul { margin-top: 1em; margin-bottom: 1em; }\n"
     "blockquote, figure { margin-left: 40px; margin-right: 40px; }\n"
@@ -39,7 +39,7 @@ static const char k_ua_css[] =
     "u, ins { text-decoration: underline; }\n"
     "s, strike, del { text-decoration: line-through; }\n"
     "mark { background-color: #ff0; color: #000; }\n"
-    "center { text-align: center; }\n"
+    "center { text-align: -webkit-center; }\n"
     "nobr { white-space: nowrap; }\n"
     "a:link { color: #0000ee; text-decoration: underline; }\n"
     "hr { border: 1px inset #808080; margin: 0.5em auto; color: #808080; }\n"
@@ -51,3 +51,8 @@ static const char k_ua_css[] =
     "ruby { display: inline; }\n"
     "rt { font-size: 50%; }\n"
     "q::before, q::after { content: '\"'; }\n";
+
+/* Additional rules for documents in quirks mode (HTML 15.3.1). */
+static const char k_quirks_css[] =
+    "table { font-weight: initial; font-style: initial; font-size: initial; line-height: initial;"
+    " white-space: initial; text-align: initial; }\n";
