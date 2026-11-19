@@ -347,6 +347,84 @@ static void run_data_url(hk_loader *l, request *r)
     finish_request(l, r, HK_OK, "");
 }
 
+static const char *file_type(hk_str path)
+{
+    static const struct {
+        const char *ext, *type;
+    } k_types[] = {
+        {".html", "text/html"}, {".htm", "text/html"},  {".xhtml", "application/xhtml+xml"},
+        {".css", "text/css"},   {".txt", "text/plain"}, {".json", "application/json"},
+        {".png", "image/png"},  {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},
+        {".gif", "image/gif"},  {".webp", "image/webp"}, {".svg", "image/svg+xml"},
+        {".ico", "image/x-icon"},
+    };
+    for (size_t i = 0; i < HK_ARRAY_LEN(k_types); i++) {
+        hk_str ext = hk_str_from_cstr(k_types[i].ext);
+        if (path.n >= ext.n && hk_str_eq_ascii_icase(hk_str_slice(path, path.n - ext.n, path.n), ext)) return k_types[i].type;
+    }
+    return "application/octet-stream";
+}
+
+/* file:///C:/dir/a%20b.html -> C:\dir\a b.html (UTF-8). */
+static void file_path(const hk_url *u, hk_charbuf *out)
+{
+    hk_str p = u->path;
+    size_t i = 0;
+    if (p.n >= 3 && p.p[0] == '/' && p.p[2] == ':') i = 1; /* drive letter */
+    if (u->host.n) {                                       /* \\host\share */
+        hk_charbuf_append(out, "\\\\", 2);
+        hk_charbuf_append(out, u->host.p, u->host.n);
+    }
+    for (; i < p.n; i++) {
+        int h1 = i + 2 < p.n ? hexv((unsigned char)p.p[i + 1]) : -1;
+        int h2 = i + 2 < p.n ? hexv((unsigned char)p.p[i + 2]) : -1;
+        if (p.p[i] == '%' && h1 >= 0 && h2 >= 0) {
+            hk_charbuf_push(out, (char)(h1 * 16 + h2));
+            i += 2;
+        } else {
+            hk_charbuf_push(out, p.p[i] == '/' ? '\\' : p.p[i]);
+        }
+    }
+    hk_charbuf_push(out, 0);
+}
+
+static void run_file_url(hk_loader *l, request *r, const hk_url *u)
+{
+    /* Web pages never read local files: only navigations and pages that are files themselves. */
+    if (r->site && !(r->site_len >= 5 && hk_str_eq_ascii_icase((hk_str){r->site, 5}, HK_STR("file:")))) {
+        finish_request(l, r, HK_ERR_BLOCKED, "a web page cannot load local files");
+        return;
+    }
+    hk_charbuf path = {0}, body = {0};
+    file_path(u, &path);
+    hk_status st = hk_plat_read_file(path.data, &body);
+    hk_vec_free(&path);
+    if (st != HK_OK) {
+        hk_vec_free(&body);
+        finish_request(l, r, st, "file not found");
+        return;
+    }
+    if (r->image) {
+        hk_vec_free(&r->body);
+        r->body = body;
+        finish_request(l, r, HK_OK, "");
+        return;
+    }
+    hk_charbuf head = {0};
+    hk_charbuf_append(&head, u->href.p, u->href.n);
+    hk_charbuf_push(&head, 0);
+    const char *type = file_type(u->path);
+    hk_charbuf_append(&head, type, strlen(type));
+    post(l, r, MSG_RESPONSE, HK_OK, 200, head.data, head.len, u->href.n);
+    for (uint32_t off = 0; off < body.len; off += 65536) {
+        uint32_t n = body.len - off < 65536 ? body.len - off : 65536;
+        post(l, r, MSG_DATA, HK_OK, 0, body.data + off, n, 0);
+    }
+    hk_vec_free(&head);
+    hk_vec_free(&body);
+    finish_request(l, r, HK_OK, "");
+}
+
 static bool same_origin(const hk_url *a, const hk_url *b)
 {
     return hk_str_eq(a->scheme, b->scheme) && hk_str_eq(a->host, b->host) && a->port == b->port;
@@ -410,6 +488,11 @@ static void run_request(hk_loader *l, request *r)
             st = HK_ERR_INVALID;
             snprintf(err, sizeof err, "invalid URL");
             break;
+        }
+        if (hop == 0 && hk_str_eq(url.scheme, HK_STR("file"))) {
+            run_file_url(l, r, &url);
+            hk_arena_free(&a);
+            return;
         }
         /* HTTPS-only mode: plain http URLs are upgraded. */
         if (hk_str_eq(url.scheme, HK_STR("http"))) {

@@ -6,3 +6,6 @@ crash-*
 leak-*
 timeout-*
 __pycache__/
+
+# Pages saved from the web for local comparison (third-party content: not committed)
+tests/page/

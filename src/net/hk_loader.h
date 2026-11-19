@@ -2,7 +2,8 @@
 /*
  * Loader: fetches URLs on the I/O thread and reports to the main thread
  * (docs/design/02-network.md, 9). Applies, per request and per redirect hop:
- * HTTPS-only upgrade, the content blocker, then the HTTP request.
+ * HTTPS-only upgrade, the content blocker, then the HTTP request. file: URLs are read from disk for
+ * navigations and for the subresources of file: pages only (never for web pages).
  */
 #ifndef HK_LOADER_H
 #define HK_LOADER_H

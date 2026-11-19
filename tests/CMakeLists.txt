@@ -8,8 +8,9 @@ add_executable(hk_tests
     test_cookies.c
     test_blocker.c
     test_form.c
+    test_layout.c
 )
-target_link_libraries(hk_tests PRIVATE hk_engine hk_net hk_style hk_form)
+target_link_libraries(hk_tests PRIVATE hk_engine hk_net hk_style hk_form hk_render)
 target_include_directories(hk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 hk_copy_runtime(hk_tests)
 

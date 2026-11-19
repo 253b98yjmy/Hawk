@@ -1077,7 +1077,8 @@ static void follow_link(tab *tb, hk_node_id link, int where)
     if (!href || !pg->has_base) return;
     hk_url u;
     if (hk_url_parse(&pg->url_arena, href->value, &pg->base, &u) != HK_OK) return;
-    if (!hk_str_eq(u.scheme, HK_STR("http")) && !hk_str_eq(u.scheme, HK_STR("https"))) {
+    bool local = hk_str_eq(u.scheme, HK_STR("file")) && strncmp(pg->url, "file:", 5) == 0;
+    if (!local && !hk_str_eq(u.scheme, HK_STR("http")) && !hk_str_eq(u.scheme, HK_STR("https"))) {
         HK_LOGI("link with unsupported scheme ignored: %.*s", (int)u.href.n, u.href.p);
         return;
     }
@@ -1775,6 +1776,22 @@ static void resolve_address(hk_str in, hk_charbuf *out)
         if (in.p[i] == ' ') space = true;
         if (in.p[i] == '.' || in.p[i] == ':') dot = true;
     }
+    /* A local path: C:\\dir\\page.html */
+    if (in.n > 3 && ((in.p[0] | 0x20) >= 'a' && (in.p[0] | 0x20) <= 'z') && in.p[1] == ':' &&
+        (in.p[2] == '\\' || in.p[2] == '/')) {
+        hk_charbuf_append(out, "file:///", 8);
+        for (size_t i = 0; i < in.n; i++) {
+            char c = in.p[i] == '\\' ? '/' : in.p[i];
+            if (c == ' ' || c == '%' || c == '#' || c == '?') {
+                char e[4];
+                snprintf(e, sizeof e, "%%%02X", (unsigned)(uint8_t)c);
+                hk_charbuf_append(out, e, 3);
+            } else {
+                hk_charbuf_push(out, c);
+            }
+        }
+        return;
+    }
     size_t scheme = hk_str_find(in, HK_STR("://"));
     if ((scheme != HK_STR_NPOS && !space) || hk_str_starts_with(in, HK_STR("hawk:")) ||
         hk_str_starts_with(in, HK_STR("data:"))) {
@@ -2140,7 +2157,11 @@ int hk_app_main(int argc, char **argv)
     if (update_filters) {
         navigate(first, "hawk:update-filters", true); /* every default list, now */
     } else {
-        navigate(first, url ? url : "hawk:start", true);
+        hk_charbuf resolved = {0};
+        if (url) resolve_address(hk_str_from_cstr(url), &resolved); /* also local paths and bare host names */
+        hk_charbuf_push(&resolved, 0);
+        navigate(first, url && resolved.len > 1 ? resolved.data : url ? url : "hawk:start", true);
+        hk_vec_free(&resolved);
         if (!url) hk_window_address_focus(a.window);
         /* Lists that are due are refreshed in the background (the first download is the user's call). */
         if (data_dir && !hk_filter_lists_missing(data_dir))

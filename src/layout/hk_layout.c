@@ -55,6 +55,7 @@ typedef struct ctx {
     const hk_layout_hooks *hooks;
     bool measure; /* intrinsic sizing: nothing is emitted */
     HK_VEC(float_rect) floats;
+    uint32_t float_base; /* floats before this index belong to enclosing formatting contexts */
     abs_vec *abs; /* pending absolutely positioned boxes of the nearest positioned ancestor */
     abs_vec fixed;
 } ctx;
@@ -182,7 +183,7 @@ static void float_band(const ctx *c, float y, float h, float x0, float x1, float
 {
     *left = x0;
     *right = x1;
-    for (uint32_t i = 0; i < c->floats.len; i++) {
+    for (uint32_t i = c->float_base; i < c->floats.len; i++) {
         const float_rect *f = &c->floats.data[i];
         if (f->bottom <= y || f->top >= y + (h > 0 ? h : 1)) continue;
         if (f->side == 1 && f->right > *left) *left = f->right;
@@ -194,7 +195,7 @@ static void float_band(const ctx *c, float y, float h, float x0, float x1, float
 static float clearance(const ctx *c, uint8_t clear)
 {
     float y = -BIG;
-    for (uint32_t i = 0; i < c->floats.len; i++) {
+    for (uint32_t i = c->float_base; i < c->floats.len; i++) {
         const float_rect *f = &c->floats.data[i];
         if ((clear & f->side) && f->bottom > y) y = f->bottom;
     }
@@ -741,7 +742,7 @@ static void place_float(flow *f, hk_node_id el, const hk_style *s)
         float_band(c, y, 1, f->x, f->x + f->w, &left, &right);
         if (right - left >= outer_w || (left == f->x && right == f->x + f->w)) break;
         float next = BIG;
-        for (uint32_t i = 0; i < c->floats.len; i++) {
+        for (uint32_t i = c->float_base; i < c->floats.len; i++) {
             const float_rect *r = &c->floats.data[i];
             if (r->bottom > y && r->bottom < next) next = r->bottom;
         }
@@ -1082,7 +1083,9 @@ static float box_contents(ctx *c, hk_node_id el, const hk_style *s, float x, flo
             push_item(c, HK_ITEM_CLIP);
         }
     }
-    uint32_t saved_floats = c->floats.len;
+    uint32_t saved_floats = c->floats.len, saved_base = c->float_base;
+    /* A new block formatting context: floats outside it do not affect its contents (CSS 2.1 9.4.1). */
+    if (bfc) c->float_base = c->floats.len;
     abs_vec own_abs = {0};
     abs_vec *saved_abs = c->abs;
     if (positioned && s->position != HK_POS_FIXED) c->abs = &own_abs;
@@ -1147,6 +1150,7 @@ static float box_contents(ctx *c, hk_node_id el, const hk_style *s, float x, flo
         if (s->height.unit == HK_LEN_PX || bb + pb > 0) *in_out = (strut){0, 0};
     }
     if (bfc) c->floats.len = saved_floats;
+    c->float_base = saved_base;
     if (s->display == HK_DISPLAY_LIST_ITEM) emit_marker(c, el, s, f.x, f.placed ? f.first_top : top);
 
     float bw = content_w + bl + br + pl + pr, bh = bottom - top;
