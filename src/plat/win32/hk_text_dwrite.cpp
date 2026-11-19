@@ -224,7 +224,7 @@ class Renderer : public IDWriteTextRenderer {
     {
         if (!c_->sink->rect) return S_OK;
         Effect *e = static_cast<Effect *>(effect);
-        hk_text_rect r = {x, y, w, h < 1 ? 1 : h, e ? e->color : c_->default_color, e ? e->user : 0};
+        hk_text_rect r = {x, y, w, h < 1 ? 1 : h, e ? e->color : c_->default_color, e ? e->user : 0, 0};
         c_->sink->rect(c_->sink->user, &r);
         return S_OK;
     }
@@ -348,9 +348,28 @@ void hk_text_layout_range_rects(hk_text_layout *l, uint32_t start, uint32_t len,
     UINT32 count = 0;
     if (FAILED(l->layout->HitTestTextRange(start, len, 0, 0, m, 32, &count))) return;
     for (UINT32 i = 0; i < count && i < 32; i++) {
-        hk_text_rect r = {m[i].left, m[i].top, m[i].width, m[i].height, 0, 0};
+        hk_text_rect r = {m[i].left, m[i].top, m[i].width, m[i].height, 0, 0, 0};
         on_rect(user, &r);
     }
+}
+
+uint32_t hk_text_layout_hit_test(hk_text_layout *l, float x, float y)
+{
+    BOOL trailing = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS m = {};
+    if (FAILED(l->layout->HitTestPoint(x, y, &trailing, &inside, &m))) return 0;
+    return m.textPosition + (trailing ? m.length : 0);
+}
+
+void hk_text_layout_caret(hk_text_layout *l, uint32_t pos, float *x, float *y, float *h)
+{
+    FLOAT px = 0, py = 0;
+    DWRITE_HIT_TEST_METRICS m = {};
+    *x = *y = *h = 0;
+    if (FAILED(l->layout->HitTestTextPosition(pos, FALSE, &px, &py, &m))) return;
+    *x = px;
+    *y = m.top;
+    *h = m.height;
 }
 
 void hk_text_layout_destroy(hk_text_layout *l)

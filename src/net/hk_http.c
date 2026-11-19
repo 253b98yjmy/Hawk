@@ -508,8 +508,8 @@ static exchange_result exchange(hk_arena *a, hk_conn *c, bool reused, const hk_c
     return st == HK_OK ? EX_OK : EX_FAIL;
 }
 
-hk_status hk_http_get(hk_http_pool *pool, hk_arena *a, const hk_url *url, hk_str extra_headers,
-                      hk_http_response *resp, const hk_http_callbacks *cb, char *err, size_t errlen)
+hk_status hk_http_request(hk_http_pool *pool, hk_arena *a, const hk_url *url, hk_str extra_headers, hk_str body,
+                          hk_http_response *resp, const hk_http_callbacks *cb, char *err, size_t errlen)
 {
     memset(resp, 0, sizeof *resp);
     bool tls = hk_str_eq(url->scheme, HK_STR("https"));
@@ -520,7 +520,9 @@ hk_status hk_http_get(hk_http_pool *pool, hk_arena *a, const hk_url *url, hk_str
     hk_charbuf req = {0};
     hk_str target = hk_url_request_target(a, url);
     char line[512];
-    hk_charbuf_append(&req, "GET ", 4);
+    bool post = body.p != NULL;
+    if (post) hk_charbuf_append(&req, "POST ", 5);
+    else hk_charbuf_append(&req, "GET ", 4);
     hk_charbuf_append(&req, target.p, target.n);
     hk_charbuf_append(&req, " HTTP/1.1\r\nHost: ", 17);
     hk_charbuf_append(&req, url->host.p, url->host.n);
@@ -538,13 +540,19 @@ hk_status hk_http_get(hk_http_pool *pool, hk_arena *a, const hk_url *url, hk_str
                      hk_http_user_agent, pool ? "keep-alive" : "close");
     hk_charbuf_append(&req, line, (size_t)n);
     hk_charbuf_append(&req, extra_headers.p, extra_headers.n);
+    if (post) {
+        n = snprintf(line, sizeof line, "Content-Length: %zu\r\n", body.n);
+        hk_charbuf_append(&req, line, (size_t)n);
+    }
     hk_charbuf_append(&req, "\r\n", 2);
+    if (post) hk_charbuf_append(&req, body.p, body.n);
 
     char key[300];
     pool_key(url, key, sizeof key);
     hk_status st = HK_OK;
     for (int attempt = 0; attempt < 2; attempt++) {
-        hk_conn *c = attempt == 0 ? pool_take(pool, key) : NULL;
+        if (post && attempt > 0) break;
+        hk_conn *c = attempt == 0 && !post ? pool_take(pool, key) : NULL;
         bool reused = c != NULL;
         if (!c) {
             st = hk_conn_open(url->host, (uint16_t)hk_url_effective_port(url), tls, &c, err, errlen);

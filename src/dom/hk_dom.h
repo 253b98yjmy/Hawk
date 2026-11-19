@@ -84,6 +84,11 @@ typedef struct hk_doctype {
     bool has_system;
 } hk_doctype;
 
+/* A form-associated element and the form the parser associated it with (its form owner). */
+typedef struct hk_form_link {
+    hk_node_id element, form;
+} hk_form_link;
+
 typedef struct hk_document {
     hk_arena arena; /* strings, attributes, text */
     hk_atom_table atoms;
@@ -91,6 +96,7 @@ typedef struct hk_document {
     HK_VEC(hk_element) elements;
     HK_VEC(hk_text) texts;
     HK_VEC(hk_doctype) doctypes;
+    HK_VEC(hk_form_link) form_links; /* in document order of creation */
     hk_node_id root; /* the Document node */
     uint8_t quirks;  /* hk_quirks_mode */
 } hk_document;

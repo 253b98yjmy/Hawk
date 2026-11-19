@@ -580,10 +580,23 @@ static hk_node_id clone_element(P *p, hk_node_id src)
     return id;
 }
 
+/* HTML 13.2.6.1 "create an element for a token", step 12: the form owner of form-associated elements. */
+static void associate_form(P *p, hk_node_id id)
+{
+    hk_atom n = el_name(p, id);
+    if (!p->form || (n != A(button) && n != A(fieldset) && n != A(input) && n != A(object) && n != A(select) &&
+                     n != A(textarea) && n != A(img)))
+        return;
+    if (stack_has(p, A(template)) || hk_dom_attr(p->doc, id, HK_ATTR_NS_NONE, A(form))) return;
+    hk_form_link fl = {id, p->form};
+    hk_vec_push(&p->doc->form_links, fl);
+}
+
 static hk_node_id insert_element_ns(P *p, const tok *t, hk_ns ns)
 {
     location loc = insertion_location(p, HK_NODE_NONE);
     hk_node_id id = create_element(p, t, ns);
+    if (ns == HK_NS_HTML) associate_form(p, id);
     insert_at(p, loc, id);
     push(p, id);
     return id;

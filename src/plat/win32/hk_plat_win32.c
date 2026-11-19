@@ -261,6 +261,28 @@ void hk_plat_decode_codepage(uint32_t codepage, const uint8_t *p, size_t n, hk_c
     hk_free(w, (size_t)wn * sizeof(wchar_t));
 }
 
+bool hk_plat_encode_codepage(uint32_t codepage, uint32_t cp, hk_charbuf *out)
+{
+    wchar_t w[2];
+    int wn = 1;
+    if (cp >= 0x10000) {
+        w[0] = (wchar_t)(0xD800 | ((cp - 0x10000) >> 10));
+        w[1] = (wchar_t)(0xDC00 | ((cp - 0x10000) & 0x3FF));
+        wn = 2;
+    } else {
+        w[0] = (wchar_t)cp;
+    }
+    char buf[16];
+    BOOL used_default = FALSE;
+    /* ISO-2022-JP (50220) and other stateful code pages do not accept the default-char flags. */
+    bool stateful = codepage >= 50000 && codepage < 60000;
+    int n = WideCharToMultiByte(codepage, stateful ? 0 : WC_NO_BEST_FIT_CHARS, w, wn, buf, (int)sizeof buf, NULL,
+                                stateful ? NULL : &used_default);
+    if (n <= 0 || used_default || (stateful && n == 1 && buf[0] == '?' && cp != '?')) return false;
+    hk_charbuf_append(out, buf, (size_t)n);
+    return true;
+}
+
 bool hk_plat_is_lead_byte(uint32_t codepage, uint8_t b)
 {
     return IsDBCSLeadByteEx(codepage, b) != 0;

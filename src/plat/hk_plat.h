@@ -36,6 +36,8 @@ bool hk_plat_idna_to_ascii(hk_arena *a, hk_str domain, hk_str *out);
 void hk_plat_decode_codepage(uint32_t codepage, const uint8_t *p, size_t n, hk_charbuf *out);
 /* True when b starts a two-byte sequence in a DBCS code page. */
 bool hk_plat_is_lead_byte(uint32_t codepage, uint8_t b);
+/* Encodes one code point; false when the code page cannot represent it. */
+bool hk_plat_encode_codepage(uint32_t codepage, uint32_t cp, hk_charbuf *out);
 
 /* Files (paths are UTF-8). */
 hk_status hk_plat_read_file(const char *path, hk_charbuf *out);

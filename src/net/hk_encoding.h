@@ -63,6 +63,12 @@ hk_encoding hk_encoding_guess(const uint8_t *p, size_t n, bool japanese_locale);
 hk_encoding hk_encoding_sniff(const uint8_t *p, size_t n, hk_encoding transport, bool japanese_locale,
                               size_t *bom_len);
 
+/* The encoding forms are submitted in for a document in enc (UTF-16 and unknown become UTF-8). */
+hk_encoding hk_encoding_for_output(hk_encoding enc);
+/* Encodes UTF-8 text into enc (an output encoding). Characters enc cannot represent are written as
+ * decimal character references ("&#12345;"), as HTML form submission does. */
+void hk_encode(hk_encoding enc, hk_str utf8, hk_charbuf *out);
+
 /* Streaming decoder to UTF-8; invalid input becomes U+FFFD. */
 typedef struct hk_decoder {
     hk_encoding enc;

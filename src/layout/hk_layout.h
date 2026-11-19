@@ -11,6 +11,7 @@
 #define HK_LAYOUT_H
 
 #include "dom/hk_dom.h"
+#include "form/hk_form.h"
 #include "plat/hk_text.h"
 #include "style/hk_style.h"
 
@@ -20,6 +21,7 @@ typedef enum hk_item_kind {
     HK_ITEM_IMAGE,  /* node = the <img> element */
     HK_ITEM_CLIP,   /* starts clipping to (x, y, w, h) until the matching HK_ITEM_UNCLIP */
     HK_ITEM_UNCLIP,
+    HK_ITEM_CONTROL, /* node = a form control; (x, y, w, h) is its content box, drawn by the painter's hook */
 } hk_item_kind;
 
 typedef struct hk_item {
@@ -31,9 +33,10 @@ typedef struct hk_item {
     hk_glyph_run run; /* glyphs: positions are absolute */
 } hk_item;
 
+/* A clickable area: a link, a <label>, a <button> or a form control (their border boxes). */
 typedef struct hk_link_rect {
     float x, y, w, h;
-    hk_node_id link; /* the <a> element */
+    hk_node_id link; /* the <a>, <label>, <button> or control element */
     uint8_t fixed;
 } hk_link_rect;
 
@@ -63,5 +66,10 @@ void hk_display_list_free(hk_display_list *dl);
 
 /* The link element at a viewport-relative position (scroll in CSS px), or none. */
 hk_node_id hk_display_list_link_at(const hk_display_list *dl, float x, float y, float scroll);
+/* The content box of a control's HK_ITEM_CONTROL item in document coordinates, or NULL. */
+const hk_item *hk_display_list_control(const hk_display_list *dl, hk_node_id el);
+
+/* The single line box of a control's text in its font: height and baseline (from the line top). */
+void hk_layout_control_line(const hk_styler *st, const hk_style *s, float *height, float *baseline);
 
 #endif

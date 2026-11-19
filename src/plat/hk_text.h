@@ -68,6 +68,7 @@ typedef struct hk_text_rect {
     float x, y, w, h;
     uint32_t color;
     uint32_t user;
+    float radius; /* corner radius for the painter (form controls); 0 = square */
 } hk_text_rect;
 
 /* Reserves a w x h box at text position pos (the text must hold U+FFFC there). baseline is the
@@ -86,6 +87,10 @@ void hk_text_layout_emit(hk_text_layout *l, const hk_text_sink *sink);
 /* Rectangles covering a text range (for links). */
 void hk_text_layout_range_rects(hk_text_layout *l, uint32_t start, uint32_t len,
                                 void (*on_rect)(void *user, const hk_text_rect *r), void *user);
+/* The text position (UTF-16 index) a point is closest to, as a caret would be placed by a click. */
+uint32_t hk_text_layout_hit_test(hk_text_layout *l, float x, float y);
+/* The caret before text position pos: its x, the top of its line and the line height. */
+void hk_text_layout_caret(hk_text_layout *l, uint32_t pos, float *x, float *y, float *h);
 void hk_text_layout_destroy(hk_text_layout *l);
 
 void hk_font_face_retain(void *face);

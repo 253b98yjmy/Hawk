@@ -43,6 +43,15 @@ void hk_loader_destroy(hk_loader *l);
  * (cookies and the cache are partitioned by it) and empty for navigations. type is one HK_REQ_*
  * (the content blocker's request type); navigations are always HK_REQ_DOCUMENT. */
 uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, uint32_t type, const hk_load_callbacks *cb);
+/* A navigation from a page (a link): referrer is that page's URL, or its origin when the page's
+ * referrer policy asks for less. The Referer header follows docs/design/02-network.md, 5: the full URL
+ * (without its fragment) to the same origin, only the origin elsewhere. Subresources send their page's
+ * URL to the same origin, its origin within the same site and nothing to other sites. */
+uint32_t hk_loader_navigate(hk_loader *l, hk_str url, hk_str referrer, const hk_load_callbacks *cb);
+/* Submits a form as a navigation: a POST of body with the given Content-Type. origin is the submitting
+ * page's origin, sent as the Origin header. A 301/302/303 redirect turns it into a GET. */
+uint32_t hk_loader_post(hk_loader *l, hk_str url, hk_str content_type, hk_str body, hk_str origin,
+                        hk_str referrer, const hk_load_callbacks *cb);
 /* Fetches and decodes an image on the I/O thread, scaled down to fit max_w x max_h (0 = original size). */
 uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
                                const hk_load_callbacks *cb);

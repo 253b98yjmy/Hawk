@@ -172,8 +172,90 @@ static void draw_image(hk_surface *s, const clip *c, int x0, int y0, int x1, int
     }
 }
 
+/* Draws a glyph run offset by (dx, dy) CSS px (dy already includes the scroll). */
+static void draw_run(hk_painter *p, hk_surface *s, const clip *cl, const hk_glyph_run *r, float dx, float dy, float scale)
+{
+    float size = r->size * scale;
+    float pen = r->x + dx;
+    float base = (r->baseline + dy) * scale;
+    for (uint32_t k = 0; k < r->count; k++) {
+        float adv = r->advances[k];
+        float gx = (r->rtl ? pen - adv - r->offsets[2 * k] : pen + r->offsets[2 * k]) * scale;
+        float gy = base - r->offsets[2 * k + 1] * scale;
+        int ix = (int)floorf(gx);
+        int frac = (int)((gx - (float)ix) * SUBPIXEL);
+        if (frac >= SUBPIXEL) frac = SUBPIXEL - 1;
+        const cached_glyph *g = glyph(p, r->face, size, r->glyphs[k], frac);
+        if (g->alpha) draw_mask_clipped(s, cl, g, ix, snap(gy), r->color);
+        pen += r->rtl ? -adv : adv;
+    }
+}
+
+/* An anti-aliased rounded rectangle (device px), coverage from the signed distance at pixel centers. */
+static void fill_round(hk_surface *s, const clip *cl, float x0, float y0, float x1, float y1, float radius,
+                       uint32_t color)
+{
+    int ix0 = (int)floorf(x0), iy0 = (int)floorf(y0), ix1 = (int)ceilf(x1), iy1 = (int)ceilf(y1);
+    if (ix0 < cl->x0) ix0 = cl->x0;
+    if (iy0 < cl->y0) iy0 = cl->y0;
+    if (ix1 > cl->x1) ix1 = cl->x1;
+    if (iy1 > cl->y1) iy1 = cl->y1;
+    float hw = (x1 - x0) / 2, hh = (y1 - y0) / 2, cx = x0 + hw, cy = y0 + hh;
+    if (radius > hw) radius = hw;
+    if (radius > hh) radius = hh;
+    for (int y = iy0; y < iy1; y++) {
+        uint32_t *row = s->pixels + (size_t)y * (size_t)s->stride;
+        float qy = fabsf((float)y + 0.5f - cy) - (hh - radius);
+        for (int x = ix0; x < ix1; x++) {
+            float qx = fabsf((float)x + 0.5f - cx) - (hw - radius);
+            float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
+            float inside = qx > qy ? qx : qy;
+            float d = sqrtf(ox * ox + oy * oy) + (inside < 0 ? inside : 0) - radius;
+            float cov = 0.5f - d;
+            if (cov <= 0) continue;
+            row[x] = blend(row[x], color, cov >= 1 ? 255u : (uint32_t)(cov * 255));
+        }
+    }
+}
+
+static void draw_text_rects(hk_surface *s, const clip *cl, const hk_text_rect *r, uint32_t n, float dx, float dy,
+                            float scale)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        if (r[i].radius > 0) {
+            fill_round(s, cl, (r[i].x + dx) * scale, (r[i].y + dy) * scale, (r[i].x + r[i].w + dx) * scale,
+                       (r[i].y + r[i].h + dy) * scale, r[i].radius * scale, r[i].color);
+            continue;
+        }
+        int x0 = snap((r[i].x + dx) * scale), y0 = snap((r[i].y + dy) * scale);
+        int x1 = snap((r[i].x + r[i].w + dx) * scale), y1 = snap((r[i].y + r[i].h + dy) * scale);
+        if (x1 == x0 && r[i].w > 0) x1 = x0 + 1;
+        if (y1 == y0 && r[i].h > 0) y1 = y0 + 1;
+        fill_clipped(s, cl, x0, y0, x1, y1, r[i].color);
+    }
+}
+
+static void paint_control(hk_painter *p, hk_surface *s, const clip *outer, const hk_item *it, float scroll, float scale,
+                          const hk_paint_hooks *hooks)
+{
+    hk_control_visual v = {0};
+    if (!hooks || !hooks->control || !hooks->control(hooks->user, it, &v)) return;
+    /* Clip to the content box, widened a little so that a caret at either end stays visible. */
+    clip c = {snap((it->x - 1) * scale), snap((it->y - scroll) * scale), snap((it->x + it->w + 1) * scale),
+              snap((it->y + it->h - scroll) * scale)};
+    if (c.x0 < outer->x0) c.x0 = outer->x0;
+    if (c.y0 < outer->y0) c.y0 = outer->y0;
+    if (c.x1 > outer->x1) c.x1 = outer->x1;
+    if (c.y1 > outer->y1) c.y1 = outer->y1;
+    if (c.x0 >= c.x1 || c.y0 >= c.y1) return;
+    float dy = it->y - scroll;
+    draw_text_rects(s, &c, v.under, v.nunder, it->x, dy, scale);
+    for (uint32_t i = 0; i < v.nruns; i++) draw_run(p, s, &c, &v.runs[i], it->x, dy, scale);
+    draw_text_rects(s, &c, v.over, v.nover, it->x, dy, scale);
+}
+
 static void paint_pass(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale,
-                       hk_paint_image_fn image, void *image_user, bool fixed_pass)
+                       const hk_paint_hooks *hooks, bool fixed_pass)
 {
     float scroll = fixed_pass ? 0 : scroll_y;
     float view_top = scroll, view_bottom = scroll + (float)s->height / scale;
@@ -214,36 +296,26 @@ static void paint_pass(hk_painter *p, const hk_display_list *dl, hk_surface *s, 
             fill_clipped(s, cl, x0, y0, x1, y1, it->color);
             continue;
         }
+        if (it->kind == HK_ITEM_CONTROL) {
+            paint_control(p, s, cl, it, scroll, scale, hooks);
+            continue;
+        }
         if (it->kind == HK_ITEM_IMAGE) {
             const uint32_t *px;
             int pw, ph;
-            if (image && image(image_user, it->node, &px, &pw, &ph))
+            if (hooks && hooks->image && hooks->image(hooks->user, it->node, &px, &pw, &ph))
                 draw_image(s, cl, snap(it->x * scale), snap((it->y - scroll) * scale), snap((it->x + it->w) * scale),
                            snap((it->y + it->h - scroll) * scale), px, pw, ph);
             continue;
         }
-        const hk_glyph_run *r = &it->run;
-        float size = r->size * scale;
-        float pen = r->x;
-        float base = (r->baseline - scroll) * scale;
-        for (uint32_t k = 0; k < r->count; k++) {
-            float adv = r->advances[k];
-            float gx = (r->rtl ? pen - adv - r->offsets[2 * k] : pen + r->offsets[2 * k]) * scale;
-            float gy = base - r->offsets[2 * k + 1] * scale;
-            int ix = (int)floorf(gx);
-            int frac = (int)((gx - (float)ix) * SUBPIXEL);
-            if (frac >= SUBPIXEL) frac = SUBPIXEL - 1;
-            const cached_glyph *g = glyph(p, r->face, size, r->glyphs[k], frac);
-            if (g->alpha) draw_mask_clipped(s, cl, g, ix, snap(gy), r->color);
-            pen += r->rtl ? -adv : adv;
-        }
+        if (it->kind == HK_ITEM_GLYPHS) draw_run(p, s, cl, &it->run, 0, -scroll, scale);
     }
 }
 
 void hk_paint(hk_painter *p, const hk_display_list *dl, hk_surface *s, float scroll_y, float scale,
-              hk_paint_image_fn image, void *image_user)
+              const hk_paint_hooks *hooks)
 {
     fill_rect(s, 0, 0, s->width, s->height, dl->canvas | 0xFF000000u);
-    paint_pass(p, dl, s, scroll_y, scale, image, image_user, false);
-    paint_pass(p, dl, s, scroll_y, scale, image, image_user, true);
+    paint_pass(p, dl, s, scroll_y, scale, hooks, false);
+    paint_pass(p, dl, s, scroll_y, scale, hooks, true);
 }

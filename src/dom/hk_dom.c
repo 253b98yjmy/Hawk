@@ -25,6 +25,7 @@ void hk_document_destroy(hk_document *d)
     hk_vec_free(&d->elements);
     hk_vec_free(&d->texts);
     hk_vec_free(&d->doctypes);
+    hk_vec_free(&d->form_links);
     hk_atom_table_free(&d->atoms);
     hk_arena_free(&d->arena);
     hk_free(d, sizeof *d);
@@ -34,7 +35,7 @@ size_t hk_document_memory(const hk_document *d)
 {
     return d->arena.bytes_reserved + (size_t)d->nodes.cap * sizeof(hk_node) +
            (size_t)d->elements.cap * sizeof(hk_element) + (size_t)d->texts.cap * sizeof(hk_text) +
-           (size_t)d->doctypes.cap * sizeof(hk_doctype) +
+           (size_t)d->doctypes.cap * sizeof(hk_doctype) + (size_t)d->form_links.cap * sizeof(hk_form_link) +
            (size_t)d->atoms.slot_cap * sizeof(uint32_t) +
            (size_t)d->atoms.entries.cap * sizeof(hk_atom_entry);
 }

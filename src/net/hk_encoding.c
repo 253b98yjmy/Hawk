@@ -3,6 +3,7 @@
 #include "base/hk_utf8.h"
 #include "plat/hk_plat.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* --- labels ------------------------------------------------------------------------------ */
@@ -527,6 +528,35 @@ static void decode_codepage(hk_decoder *d, const uint8_t *p, size_t n, bool last
     if (end < n) {
         d->pending[0] = p[end];
         d->pending_len = 1;
+    }
+}
+
+hk_encoding hk_encoding_for_output(hk_encoding enc)
+{
+    return (enc == HK_ENC_UNKNOWN || enc == HK_ENC_UTF16LE || enc == HK_ENC_UTF16BE || enc >= HK_ENC_COUNT_)
+               ? HK_ENC_UTF8
+               : enc;
+}
+
+void hk_encode(hk_encoding enc, hk_str utf8, hk_charbuf *out)
+{
+    enc = hk_encoding_for_output(enc);
+    if (enc == HK_ENC_UTF8) {
+        hk_charbuf_append(out, utf8.p, utf8.n);
+        return;
+    }
+    uint32_t codepage = enc == HK_ENC_WINDOWS_1252 ? 1252 : k_info[enc].codepage;
+    size_t i = 0;
+    while (i < utf8.n) {
+        uint32_t cp;
+        i += hk_utf8_decode((const uint8_t *)utf8.p + i, utf8.n - i, &cp);
+        if (cp < 0x80) {
+            hk_charbuf_push(out, (char)cp);
+        } else if (!hk_plat_encode_codepage(codepage, cp, out)) {
+            char ref[16];
+            int n = snprintf(ref, sizeof ref, "&#%u;", cp);
+            hk_charbuf_append(out, ref, (size_t)n);
+        }
     }
 }
 

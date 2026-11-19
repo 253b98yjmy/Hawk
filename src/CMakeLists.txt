@@ -34,7 +34,7 @@ add_library(hk_plat STATIC
     plat/win32/hk_text_dwrite.cpp
     plat/win32/hk_image_wic.c
 )
-target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 dwmapi advapi32 normaliz ws2_32 secur32 dwrite windowscodecs ole32)
+target_link_libraries(hk_plat PUBLIC hk_base PRIVATE user32 gdi32 imm32 dwmapi advapi32 normaliz ws2_32 secur32 dwrite windowscodecs ole32)
 
 # --- css + style: parsing and the cascade ------------------------------------
 add_library(hk_style STATIC
@@ -49,8 +49,9 @@ target_link_libraries(hk_style PUBLIC hk_engine hk_plat)
 add_library(hk_render STATIC
     layout/hk_layout.c
     paint/hk_paint.c
+    form/hk_form_view.c
 )
-target_link_libraries(hk_render PUBLIC hk_style)
+target_link_libraries(hk_render PUBLIC hk_style hk_form)
 
 # --- third_party/zlib (inflate only) -----------------------------------------
 set(ZLIB_DIR ${PROJECT_SOURCE_DIR}/third_party/zlib)
@@ -77,6 +78,12 @@ add_library(hk_net STATIC
     blocker/hk_regex.c
 )
 target_link_libraries(hk_net PUBLIC hk_base hk_plat PRIVATE hk_zlib)
+
+# --- form: control state, editing and submission --------------------------------
+add_library(hk_form STATIC
+    form/hk_form.c
+)
+target_link_libraries(hk_form PUBLIC hk_engine hk_net)
 
 if(HK_FUZZ)
     return()

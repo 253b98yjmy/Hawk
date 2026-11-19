@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
- * Hawk application (M2): loads a page with its stylesheets, lays it out and paints it.
+ * Hawk application (M3): loads a page with its stylesheets, lays it out and paints it; form controls.
  *
  *   hawk.exe [options] [URL]
  *     --filters FILE      add a filter list (in addition to %LOCALAPPDATA%\Hawk\filters\*.txt)
@@ -8,14 +8,19 @@
  *     --exit-after-load   log load statistics and exit when the page is displayed
  *     --screenshot FILE   with --exit-after-load: save the window as a BMP before exiting
  *     --wait-images       with --exit-after-load: also wait for the images near the viewport
+ *     --fill NAME=VALUE   after the first page loads: set the text control named NAME (repeatable)
+ *     --submit            after --fill: submit the form of the last filled control
  *     --smoke             exit after the first frame (startup time and memory)
  */
 #include "base/hk_log.h"
 #include "base/hk_map64.h"
 #include "base/hk_mem.h"
+#include "base/hk_utf8.h"
 #include "blocker/hk_filter_store.h"
 #include "css/hk_css.h"
 #include "dom/hk_dom.h"
+#include "form/hk_form.h"
+#include "form/hk_form_view.h"
 #include "html/hk_html_parser.h"
 #include "layout/hk_layout.h"
 #include "net/hk_encoding.h"
@@ -79,6 +84,14 @@ typedef struct page {
     bool relayout_pending;
     size_t image_bytes;
     uint32_t images_loaded;
+    /* forms */
+    hk_forms *forms; /* created on first use */
+    hk_node_id focus;   /* the focused control */
+    hk_node_id pressed; /* the clickable element under the mouse button */
+    bool selecting;     /* dragging a selection in the focused text control */
+    bool autofocus_done;
+    uint16_t comp[256]; /* IME composition */
+    uint32_t comp_len, comp_caret;
 } page;
 
 typedef enum { IMG_NONE, IMG_REQUESTED, IMG_READY, IMG_BROKEN } img_state;
@@ -95,6 +108,8 @@ typedef struct page_image {
 typedef struct history_entry {
     char url[2048];
     float scroll;
+    char *post; /* the body of a form submission (POST), or NULL */
+    size_t post_len;
 } history_entry;
 
 struct app {
@@ -110,11 +125,18 @@ struct app {
     bool smoke, exit_after_load, wait_images;
     const char *screenshot;
     hk_node_id hover_link;
+    hk_form_view *form_view;
+    const char *fill[8]; /* --fill NAME=VALUE */
+    int nfill;
+    bool submit_after_fill;
 };
 
 static void navigate(app *a, const char *url, bool push);
 static void show_document(app *a);
 static void relayout_with(app *a, bool restyle);
+static void apply_fill(app *a);
+static void autofocus(app *a);
+static void scroll_by(app *a, float dy);
 
 /* --- helpers ---------------------------------------------------------------------------------- */
 
@@ -167,6 +189,8 @@ static void page_reset(app *a)
     hk_vec_free(&pg->images);
     hk_map64_free(&pg->image_index);
     hk_display_list_free(&pg->dl);
+    hk_forms_destroy(pg->forms);
+    if (a->window) hk_window_set_text_input(a->window, false, 0, 0, 0);
     hk_painter_clear_cache(a->painter); /* glyph masks keep the old page's fonts alive */
     hk_vec_free(&pg->sniff);
     hk_vec_free(&pg->utf8);
@@ -261,7 +285,7 @@ static hk_image_state hook_image_size(void *user, hk_node_id img, float *w, floa
 
 static bool paint_image(void *user, hk_node_id img, const uint32_t **pixels, int *w, int *h)
 {
-    page_image *im = image_entry(user, img, false);
+    page_image *im = image_entry(&((app *)user)->page, img, false);
     if (!im || im->state != IMG_READY || !im->img.pixels) return false;
     *pixels = im->img.pixels;
     *w = im->img.width;
@@ -541,6 +565,11 @@ static void show_document(app *a)
     hk_window_set_cursor(a->window, HK_CURSOR_ARROW);
     pg->t_shown = hk_plat_now_ns();
     log_stats(a);
+    if (a->nfill || a->submit_after_fill) {
+        apply_fill(a);
+        return;
+    }
+    autofocus(a);
     maybe_exit(a);
 }
 
@@ -748,7 +777,12 @@ static void on_response(void *user, const hk_load_response *r)
     mime = hk_str_trim_ascii_ws(mime);
     pg->html = mime.n == 0 || hk_str_eq_ascii_icase(mime, HK_STR("text/html")) ||
                hk_str_eq_ascii_icase(mime, HK_STR("application/xhtml+xml"));
-    pg->plain = !pg->html && hk_str_eq_ascii_icase(mime, HK_STR("text/plain"));
+    /* Other text (CSS, JSON, XML sources, ...) is shown as plain text. */
+    pg->plain = !pg->html && (hk_str_starts_with(mime, HK_STR("text/")) || hk_str_starts_with(mime, HK_STR("TEXT/")) ||
+                              hk_str_eq_ascii_icase(mime, HK_STR("application/json")) ||
+                              hk_str_eq_ascii_icase(mime, HK_STR("application/xml")) ||
+                              hk_str_eq_ascii_icase(mime, HK_STR("application/javascript")) ||
+                              hk_str_ends_with(mime, HK_STR("+json")) || hk_str_ends_with(mime, HK_STR("+xml")));
     pg->unsupported = !pg->html && !pg->plain;
     pg->transport = hk_encoding_from_content_type(r->content_type);
 }
@@ -834,17 +868,103 @@ static void on_done(void *user, hk_status st, const char *message)
 
 static void show_internal(app *a, const char *url);
 
+static void free_history_from(app *a, uint32_t from)
+{
+    for (uint32_t i = from; i < a->history.len; i++)
+        if (a->history.data[i].post) hk_free(a->history.data[i].post, a->history.data[i].post_len + 1);
+    a->history.len = from;
+}
+
+static void push_history(app *a, const char *url, hk_str post)
+{
+    if (a->history_pos) a->history.data[a->history_pos - 1].scroll = a->scroll;
+    free_history_from(a, a->history_pos); /* drop the forward entries */
+    history_entry e = {{0}, 0, NULL, 0};
+    snprintf(e.url, sizeof e.url, "%s", url);
+    if (post.p) {
+        e.post = hk_alloc(post.n + 1);
+        memcpy(e.post, post.p, post.n);
+        e.post[post.n] = 0;
+        e.post_len = post.n;
+    }
+    hk_vec_push(&a->history, e);
+    a->history_pos = a->history.len;
+    a->restore_scroll = 0;
+}
+
+/* What a navigation from the current page sends as its referrer: the page URL, its origin, or
+   nothing, following the page's <meta name=referrer> (the loader then applies Hawk's own policy). */
+static void page_referrer(app *a, hk_charbuf *out)
+{
+    page *pg = &a->page;
+    out->len = 0;
+    if (!pg->doc || !pg->has_base || strncmp(pg->url, "http", 4) != 0) return;
+    hk_str policy = {0};
+    for (hk_node_id n = 1; n < pg->doc->nodes.len; n++) {
+        if (!hk_dom_is_html(pg->doc, n, A(meta))) continue;
+        const hk_attr *name = hk_dom_attr(pg->doc, n, HK_ATTR_NS_NONE, A(name));
+        const hk_attr *content = hk_dom_attr(pg->doc, n, HK_ATTR_NS_NONE, A(content));
+        if (name && content && hk_str_eq_ascii_icase(hk_str_trim_ascii_ws(name->value), HK_STR("referrer")))
+            policy = hk_str_trim_ascii_ws(content->value);
+    }
+    if (hk_str_eq_ascii_icase(policy, HK_STR("no-referrer")) || hk_str_eq_ascii_icase(policy, HK_STR("never"))) return;
+    hk_arena tmp;
+    hk_arena_init(&tmp, 1024);
+    hk_url u;
+    if (hk_url_parse(&tmp, hk_str_from_cstr(pg->url), NULL, &u) == HK_OK) {
+        if (hk_str_eq_ascii_icase(policy, HK_STR("origin")) || hk_str_eq_ascii_icase(policy, HK_STR("strict-origin"))) {
+            hk_charbuf_append(out, u.scheme.p, u.scheme.n);
+            hk_charbuf_append(out, "://", 3);
+            hk_charbuf_append(out, u.host.p, u.host.n);
+            if (u.port >= 0) {
+                char port[16];
+                int n = snprintf(port, sizeof port, ":%d", u.port);
+                hk_charbuf_append(out, port, (size_t)n);
+            }
+            hk_charbuf_push(out, '/');
+        } else {
+            hk_charbuf_append(out, u.href.p, u.href.n);
+        }
+    }
+    hk_arena_free(&tmp);
+}
+
+/* Submits a form body to url (a navigation that replaces the page). */
+static void navigate_post(app *a, const char *url, hk_str body, hk_str origin)
+{
+    hk_charbuf ref = {0};
+    page_referrer(a, &ref);
+    page_reset(a);
+    page *pg = &a->page;
+    snprintf(pg->url, sizeof pg->url, "%s", url);
+    pg->loading = true;
+    pg->t_start = hk_plat_now_ns();
+    hk_window_set_cursor(a->window, HK_CURSOR_WAIT);
+    hk_load_callbacks cb = {a, on_response, on_data, on_done};
+    pg->load_id = hk_loader_post(a->loader, hk_str_from_cstr(url), HK_STR("application/x-www-form-urlencoded"), body,
+                                 origin, (hk_str){ref.data, ref.len}, &cb);
+    hk_vec_free(&ref);
+}
+
+static void navigate_from(app *a, const char *url, bool push, hk_str referrer);
+
 static void navigate(app *a, const char *url, bool push)
 {
-    if (push) {
-        if (a->history_pos) a->history.data[a->history_pos - 1].scroll = a->scroll;
-        a->history.len = a->history_pos; /* drop the forward entries */
-        history_entry e = {{0}, 0};
-        snprintf(e.url, sizeof e.url, "%s", url);
-        hk_vec_push(&a->history, e);
-        a->history_pos = a->history.len;
-        a->restore_scroll = 0;
-    }
+    navigate_from(a, url, push, (hk_str){0});
+}
+
+/* A navigation from the current page (a link or a GET form): sends the page as the referrer. */
+static void navigate_link(app *a, const char *url)
+{
+    hk_charbuf ref = {0};
+    page_referrer(a, &ref);
+    navigate_from(a, url, true, (hk_str){ref.data, ref.len});
+    hk_vec_free(&ref);
+}
+
+static void navigate_from(app *a, const char *url, bool push, hk_str referrer)
+{
+    if (push) push_history(a, url, (hk_str){0});
     page_reset(a);
     page *pg = &a->page;
     snprintf(pg->url, sizeof pg->url, "%s", url);
@@ -857,7 +977,7 @@ static void navigate(app *a, const char *url, bool push)
     pg->t_start = hk_plat_now_ns();
     hk_window_set_cursor(a->window, HK_CURSOR_WAIT);
     hk_load_callbacks cb = {a, on_response, on_data, on_done};
-    pg->load_id = hk_loader_fetch(a->loader, hk_str_from_cstr(url), HK_STR(""), HK_REQ_DOCUMENT, &cb);
+    pg->load_id = hk_loader_navigate(a->loader, hk_str_from_cstr(url), referrer, &cb);
 }
 
 static void go_history(app *a, int delta)
@@ -870,7 +990,47 @@ static void go_history(app *a, int delta)
     a->restore_scroll = a->history.data[target].scroll;
     char url[2048];
     snprintf(url, sizeof url, "%s", a->history.data[target].url);
+    if (a->history.data[target].post) {
+        /* A form submission is not sent again without asking. */
+        page_reset(a);
+        snprintf(a->page.url, sizeof a->page.url, "%s", url);
+        /* フォームの送信結果 / このページはフォームを送信した結果です。… */
+        show_message(a, "\xE3\x83\x95\xE3\x82\xA9\xE3\x83\xBC\xE3\x83\xA0\xE3\x81\xAE\xE9\x80\x81\xE4\xBF\xA1"
+                        "\xE7\xB5\x90\xE6\x9E\x9C",
+                     "\xE3\x81\x93\xE3\x81\xAE\xE3\x83\x9A\xE3\x83\xBC\xE3\x82\xB8\xE3\x81\xAF\xE3\x83\x95\xE3"
+                     "\x82\xA9\xE3\x83\xBC\xE3\x83\xA0\xE3\x82\x92\xE9\x80\x81\xE4\xBF\xA1\xE3\x81\x97\xE3\x81"
+                     "\x9F\xE7\xB5\x90\xE6\x9E\x9C\xE3\x81\xA7\xE3\x81\x99\xE3\x80\x82\xE5\x86\x8D\xE9\x80\x81"
+                     "\xE4\xBF\xA1\xE3\x81\x99\xE3\x82\x8B\xE3\x81\xA8\xE3\x80\x81\xE5\x90\x8C\xE3\x81\x98\xE6"
+                     "\x93\x8D\xE4\xBD\x9C\xEF\xBC\x88\xE8\xB3\xBC\xE5\x85\xA5\xE3\x82\x84\xE6\x8A\x95\xE7\xA8"
+                     "\xBF\xE3\x81\xAA\xE3\x81\xA9\xEF\xBC\x89\xE3\x81\x8C\xE7\xB9\xB0\xE3\x82\x8A\xE8\xBF\x94"
+                     "\xE3\x81\x95\xE3\x82\x8C\xE3\x82\x8B\xE3\x81\x93\xE3\x81\xA8\xE3\x81\x8C\xE3\x81\x82\xE3"
+                     "\x82\x8A\xE3\x81\xBE\xE3\x81\x99\xE3\x80\x82 Shift+F5: "
+                     "\xE5\x86\x8D\xE9\x80\x81\xE4\xBF\xA1");
+        return;
+    }
     navigate(a, url, false);
+}
+
+/* Shift+F5 on a form submission's entry: sends it again. */
+static void resubmit(app *a)
+{
+    if (!a->history_pos) return;
+    history_entry *e = &a->history.data[a->history_pos - 1];
+    if (!e->post) return;
+    char url[2048];
+    snprintf(url, sizeof url, "%s", e->url);
+    hk_arena tmp;
+    hk_arena_init(&tmp, 1024);
+    hk_url u;
+    hk_charbuf origin = {0};
+    if (hk_url_parse(&tmp, hk_str_from_cstr(url), NULL, &u) == HK_OK) {
+        hk_charbuf_append(&origin, u.scheme.p, u.scheme.n);
+        hk_charbuf_append(&origin, "://", 3);
+        hk_charbuf_append(&origin, u.host.p, u.host.n);
+    }
+    navigate_post(a, url, (hk_str){e->post, e->post_len}, (hk_str){origin.data, origin.len});
+    hk_vec_free(&origin);
+    hk_arena_free(&tmp);
 }
 
 static void follow_link(app *a, hk_node_id link)
@@ -892,7 +1052,370 @@ static void follow_link(app *a, hk_node_id link)
     }
     char url[2048];
     snprintf(url, sizeof url, "%.*s", (int)u.href.n, u.href.p);
-    navigate(a, url, true);
+    navigate_link(a, url);
+}
+
+/* --- forms --------------------------------------------------------------------------------------- */
+
+static hk_forms *page_forms(app *a)
+{
+    page *pg = &a->page;
+    if (!pg->forms && pg->doc) pg->forms = hk_forms_create(pg->doc);
+    return pg->forms;
+}
+
+static hk_form_ctx form_ctx(app *a)
+{
+    page *pg = &a->page;
+    hk_form_ctx c = {0};
+    c.doc = pg->doc;
+    c.st = pg->styler;
+    c.forms = page_forms(a);
+    c.focus = pg->focus;
+    c.show_caret = true;
+    c.comp = pg->comp;
+    c.comp_len = pg->comp_len;
+    c.comp_caret = pg->comp_caret;
+    return c;
+}
+
+static bool paint_control(void *user, const hk_item *it, hk_control_visual *v)
+{
+    app *a = user;
+    if (!a->page.doc || !a->page.styler) return false;
+    hk_form_ctx c = form_ctx(a);
+    return hk_form_view_visual(a->form_view, &c, it, v);
+}
+
+static bool focused_text(app *a)
+{
+    page *pg = &a->page;
+    return pg->focus && hk_control_is_text(hk_control_kind_of(pg->doc, pg->focus));
+}
+
+/* Keeps the IME's candidate window at the caret of the focused text control. */
+static void update_text_input(app *a)
+{
+    page *pg = &a->page;
+    const hk_item *it = focused_text(a) ? hk_display_list_control(&pg->dl, pg->focus) : NULL;
+    if (!it || hk_control_readonly(pg->doc, pg->focus)) {
+        hk_window_set_text_input(a->window, false, 0, 0, 0);
+        return;
+    }
+    hk_form_ctx c = form_ctx(a);
+    float x, y, h;
+    hk_form_view_caret(a->form_view, &c, it, &x, &y, &h);
+    float scale = scale_of(a), sy = it->fixed ? 0 : a->scroll;
+    hk_window_set_text_input(a->window, true, (int)((it->x + x) * scale), (int)((it->y + y - sy) * scale),
+                             (int)(h * scale));
+}
+
+static void set_focus(app *a, hk_node_id el)
+{
+    page *pg = &a->page;
+    if (pg->focus != el) {
+        pg->comp_len = 0;
+        pg->focus = el;
+    }
+    update_text_input(a);
+    hk_window_invalidate(a->window);
+}
+
+/* Scrolls the page so that the focused control is visible. */
+static void scroll_to_focus(app *a)
+{
+    page *pg = &a->page;
+    const hk_item *it = pg->focus ? hk_display_list_control(&pg->dl, pg->focus) : NULL;
+    if (!it || it->fixed) return;
+    float vw, vh;
+    viewport_css(a, &vw, &vh);
+    if (it->y < a->scroll) scroll_by(a, it->y - a->scroll - 20);
+    else if (it->y + it->h > a->scroll + vh) scroll_by(a, it->y + it->h - a->scroll - vh + 20);
+    update_text_input(a);
+}
+
+static void submit_form(app *a, hk_node_id form, hk_node_id submitter)
+{
+    page *pg = &a->page;
+    if (!form || !pg->has_base) return;
+    hk_form_submission sub;
+    if (!hk_forms_submit(page_forms(a), form, submitter, &pg->base, pg->encoding, &sub)) {
+        HK_LOGI("form not submitted (unsupported method or action)");
+        return;
+    }
+    hk_charbuf_push(&sub.url, 0);
+    HK_LOGI("submit %s %s%s%.*s", sub.post ? "POST" : "GET", sub.url.data, sub.post ? " body " : "",
+            sub.post ? (int)(sub.body.len < 200 ? sub.body.len : 200) : 0, sub.body.data ? sub.body.data : "");
+    if (sub.post) {
+        hk_arena tmp;
+        hk_arena_init(&tmp, 1024);
+        hk_url u;
+        hk_charbuf origin = {0};
+        if (hk_url_parse(&tmp, hk_str_from_cstr(pg->url), NULL, &u) == HK_OK && u.host.n) {
+            hk_charbuf_append(&origin, u.scheme.p, u.scheme.n);
+            hk_charbuf_append(&origin, "://", 3);
+            hk_charbuf_append(&origin, u.host.p, u.host.n);
+            if (u.port >= 0) {
+                char port[16];
+                int n = snprintf(port, sizeof port, ":%d", u.port);
+                hk_charbuf_append(&origin, port, (size_t)n);
+            }
+        }
+        hk_arena_free(&tmp);
+        push_history(a, sub.url.data, (hk_str){sub.body.data ? sub.body.data : "", sub.body.len});
+        navigate_post(a, sub.url.data, (hk_str){sub.body.data ? sub.body.data : "", sub.body.len},
+                      (hk_str){origin.data, origin.len});
+        hk_vec_free(&origin);
+    } else {
+        navigate_link(a, sub.url.data);
+    }
+    hk_form_submission_free(&sub);
+}
+
+/* Implicit submission (Enter in a text field): the form's first submit button is the submitter. */
+static void implicit_submit(app *a, hk_node_id el)
+{
+    page *pg = &a->page;
+    hk_node_id form = hk_form_owner(pg->doc, el);
+    if (!form) return;
+    hk_node_id submitter = HK_NODE_NONE;
+    for (hk_node_id n = pg->doc->root; n && !submitter;) {
+        const hk_node *x = hk_dom_node(pg->doc, n);
+        hk_control_kind k = hk_control_kind_of(pg->doc, n);
+        if ((k == HK_CTRL_SUBMIT || k == HK_CTRL_IMAGE) && hk_form_owner(pg->doc, n) == form) submitter = n;
+        if (x->first_child) {
+            n = x->first_child;
+            continue;
+        }
+        while (n && !hk_dom_node(pg->doc, n)->next) n = hk_dom_node(pg->doc, n)->parent;
+        if (n) n = hk_dom_node(pg->doc, n)->next;
+    }
+    if (submitter && hk_control_disabled(pg->doc, submitter)) return;
+    submit_form(a, form, submitter);
+}
+
+static void open_select(app *a, hk_node_id select)
+{
+    page *pg = &a->page;
+    const hk_item *it = hk_display_list_control(&pg->dl, select);
+    if (!it) return;
+    hk_node_vec opts = {0};
+    hk_select_options(pg->doc, select, &opts);
+    if (!opts.len) {
+        hk_vec_free(&opts);
+        return;
+    }
+    hk_forms *f = page_forms(a);
+    hk_charbuf *bufs = hk_alloc_zero(opts.len * sizeof(hk_charbuf));
+    hk_str *labels = hk_alloc(opts.len * sizeof(hk_str));
+    uint8_t *flags = hk_alloc(opts.len);
+    for (uint32_t i = 0; i < opts.len; i++) {
+        hk_str l = hk_option_label(pg->doc, opts.data[i], &bufs[i]);
+        if (l.p != bufs[i].data) {
+            hk_charbuf_append(&bufs[i], l.p, l.n); /* the label attribute: copy, as bufs own the strings */
+            l = (hk_str){bufs[i].data, l.n};
+        }
+        labels[i] = l;
+        hk_node_id parent = hk_dom_node(pg->doc, opts.data[i])->parent;
+        bool disabled = hk_dom_attr(pg->doc, opts.data[i], HK_ATTR_NS_NONE, A(disabled)) ||
+                        (hk_dom_is_html(pg->doc, parent, A(optgroup)) &&
+                         hk_dom_attr(pg->doc, parent, HK_ATTR_NS_NONE, A(disabled)));
+        flags[i] = (uint8_t)((disabled ? 1 : 0) | (hk_forms_option_selected(f, select, i) ? 2 : 0));
+    }
+    float scale = scale_of(a), sy = it->fixed ? 0 : a->scroll;
+    const hk_style *s = hk_style_of(pg->styler, select);
+    float bottom = it->y + it->h + (s ? s->border_width[2] + 2 : 2);
+    int choice = hk_window_popup_menu(a->window, labels, flags, opts.len, (int)((it->x - 3) * scale),
+                                      (int)((bottom - sy) * scale));
+    if (choice >= 0 && !(flags[choice] & 1)) hk_forms_select(f, select, (uint32_t)choice);
+    for (uint32_t i = 0; i < opts.len; i++) hk_vec_free(&bufs[i]);
+    hk_free(bufs, opts.len * sizeof(hk_charbuf));
+    hk_free(labels, opts.len * sizeof(hk_str));
+    hk_free(flags, opts.len);
+    hk_vec_free(&opts);
+    hk_window_invalidate(a->window);
+}
+
+/* A click on (or Space/Enter on) a control. */
+static void activate_control(app *a, hk_node_id el)
+{
+    page *pg = &a->page;
+    if (hk_control_disabled(pg->doc, el)) return;
+    hk_forms *f = page_forms(a);
+    switch (hk_control_kind_of(pg->doc, el)) {
+    case HK_CTRL_CHECKBOX: hk_forms_set_checked(f, el, !hk_forms_checked(f, el)); break;
+    case HK_CTRL_RADIO: hk_forms_set_checked(f, el, true); break;
+    case HK_CTRL_SUBMIT:
+    case HK_CTRL_IMAGE: submit_form(a, hk_form_owner(pg->doc, el), el); return;
+    case HK_CTRL_RESET: hk_forms_reset(f, hk_form_owner(pg->doc, el)); break;
+    case HK_CTRL_SELECT: open_select(a, el); return;
+    default: break;
+    }
+    hk_window_invalidate(a->window);
+}
+
+static void autofocus(app *a)
+{
+    page *pg = &a->page;
+    if (pg->autofocus_done || pg->focus) return;
+    pg->autofocus_done = true;
+    for (uint32_t i = 0; i < pg->dl.items.len; i++) {
+        const hk_item *it = &pg->dl.items.data[i];
+        if (it->kind == HK_ITEM_CONTROL && hk_dom_attr(pg->doc, it->node, HK_ATTR_NS_NONE, A(autofocus)) &&
+            !hk_control_disabled(pg->doc, it->node)) {
+            set_focus(a, it->node);
+            return;
+        }
+    }
+}
+
+/* --fill NAME=VALUE and --submit: drives a form without the mouse (tests and measurements). */
+static void apply_fill(app *a)
+{
+    page *pg = &a->page;
+    hk_forms *f = page_forms(a);
+    hk_node_id last = HK_NODE_NONE;
+    for (int i = 0; i < a->nfill && f; i++) {
+        const char *eq = strchr(a->fill[i], '=');
+        if (!eq) continue;
+        hk_str name = {a->fill[i], (size_t)(eq - a->fill[i])};
+        for (uint32_t k = 0; k < pg->dl.items.len; k++) {
+            const hk_item *it = &pg->dl.items.data[k];
+            if (it->kind != HK_ITEM_CONTROL) continue;
+            const hk_attr *n = hk_dom_attr(pg->doc, it->node, HK_ATTR_NS_NONE, A(name));
+            if (!n || !hk_str_eq(n->value, name) || !hk_control_is_text(hk_control_kind_of(pg->doc, it->node))) continue;
+            hk_forms_set_value(f, it->node, hk_str_from_cstr(eq + 1));
+            last = it->node;
+            break;
+        }
+    }
+    a->nfill = 0;
+    if (!last) HK_LOGW("--fill: no matching text control");
+    if (a->screenshot && !a->submit_after_fill && hk_window_save_bmp(a->window, a->screenshot) != HK_OK)
+        HK_LOGW("could not save %s", a->screenshot);
+    if (a->submit_after_fill && last) {
+        a->submit_after_fill = false;
+        set_focus(a, last);
+        implicit_submit(a, last);
+        return;
+    }
+    a->submit_after_fill = false;
+    maybe_exit(a);
+}
+
+/* Keys for the focused control. Returns true when consumed. */
+static bool form_key(app *a, hk_key key, unsigned mods)
+{
+    page *pg = &a->page;
+    if (!pg->focus) return false;
+    hk_control_kind k = hk_control_kind_of(pg->doc, pg->focus);
+    hk_forms *f = page_forms(a);
+    bool shift = (mods & HK_MOD_SHIFT) != 0, ctrl = (mods & HK_MOD_CTRL) != 0;
+    if (key == HK_KEY_ESCAPE) {
+        set_focus(a, HK_NODE_NONE);
+        return true;
+    }
+    if (key == HK_KEY_TAB) {
+        /* The next (or previous) control in layout order. */
+        hk_node_id first = 0, last = 0, prev = 0, next = 0;
+        bool seen = false;
+        for (uint32_t i = 0; i < pg->dl.items.len; i++) {
+            const hk_item *it = &pg->dl.items.data[i];
+            if (it->kind != HK_ITEM_CONTROL || hk_control_disabled(pg->doc, it->node)) continue;
+            if (!first) first = it->node;
+            last = it->node;
+            if (it->node == pg->focus) seen = true;
+            else if (!seen) prev = it->node;
+            else if (!next) next = it->node;
+        }
+        hk_node_id to = shift ? (prev ? prev : last) : (next ? next : first);
+        set_focus(a, to);
+        scroll_to_focus(a);
+        return true;
+    }
+    if (!hk_control_is_text(k)) {
+        if (key == HK_KEY_SPACE || (key == HK_KEY_ENTER && k != HK_CTRL_CHECKBOX && k != HK_CTRL_RADIO)) {
+            activate_control(a, pg->focus);
+            return true;
+        }
+        return false;
+    }
+    bool changed = false;
+    hk_edit_cmd cmd;
+    switch (key) {
+    case HK_KEY_LEFT: cmd = ctrl ? HK_EDIT_WORD_LEFT : HK_EDIT_LEFT; break;
+    case HK_KEY_RIGHT: cmd = ctrl ? HK_EDIT_WORD_RIGHT : HK_EDIT_RIGHT; break;
+    case HK_KEY_HOME: cmd = HK_EDIT_HOME; break;
+    case HK_KEY_END: cmd = HK_EDIT_END; break;
+    case HK_KEY_BACKSPACE: cmd = ctrl ? HK_EDIT_WORD_BACKSPACE : HK_EDIT_BACKSPACE; break;
+    case HK_KEY_DELETE: cmd = ctrl ? HK_EDIT_WORD_DELETE : HK_EDIT_DELETE; break;
+    case HK_KEY_ENTER:
+        if (k == HK_CTRL_TEXTAREA) {
+            hk_forms_insert(f, pg->focus, HK_STR("\n"));
+            update_text_input(a);
+            hk_window_invalidate(a->window);
+        } else {
+            implicit_submit(a, pg->focus);
+        }
+        return true;
+    case HK_KEY_SPACE: return true; /* the character arrives through on_char */
+    case HK_KEY_UP:
+    case HK_KEY_DOWN:
+    case HK_KEY_PAGE_UP:
+    case HK_KEY_PAGE_DOWN: return k == HK_CTRL_TEXTAREA;
+    default:
+        if (ctrl && key == HK_KEY_LETTER('A')) {
+            cmd = HK_EDIT_SELECT_ALL;
+            break;
+        }
+        if (ctrl && (key == HK_KEY_LETTER('C') || key == HK_KEY_LETTER('X'))) {
+            hk_str sel = hk_forms_selected_text(f, pg->focus);
+            if (sel.n) hk_plat_clipboard_set(sel);
+            if (key == HK_KEY_LETTER('X') && sel.n && hk_forms_edit(f, pg->focus, HK_EDIT_DELETE, false)) changed = true;
+            if (changed) hk_window_invalidate(a->window);
+            return true;
+        }
+        if (ctrl && key == HK_KEY_LETTER('V')) {
+            hk_charbuf clip = {0};
+            if (hk_plat_clipboard_get(&clip)) hk_forms_insert(f, pg->focus, (hk_str){clip.data ? clip.data : "", clip.len});
+            hk_vec_free(&clip);
+            update_text_input(a);
+            hk_window_invalidate(a->window);
+            return true;
+        }
+        return false;
+    }
+    hk_forms_edit(f, pg->focus, cmd, shift);
+    update_text_input(a);
+    hk_window_invalidate(a->window);
+    return true;
+}
+
+static void on_char(void *user, hk_window *w, uint32_t cp)
+{
+    HK_UNUSED(w);
+    app *a = user;
+    page *pg = &a->page;
+    if (!focused_text(a)) return; /* Space on other controls is handled as a key */
+    uint8_t u[4];
+    size_t n = hk_utf8_encode(cp, u);
+    hk_forms_insert(page_forms(a), pg->focus, (hk_str){(const char *)u, n});
+    update_text_input(a);
+    hk_window_invalidate(a->window);
+}
+
+static void on_composition(void *user, hk_window *w, const uint16_t *text, uint32_t len, uint32_t caret)
+{
+    HK_UNUSED(w);
+    app *a = user;
+    page *pg = &a->page;
+    if (!focused_text(a)) return;
+    if (len > HK_ARRAY_LEN(pg->comp)) len = HK_ARRAY_LEN(pg->comp);
+    if (len) memcpy(pg->comp, text, len * sizeof(uint16_t));
+    pg->comp_len = len;
+    pg->comp_caret = caret;
+    update_text_input(a);
+    hk_window_invalidate(a->window);
 }
 
 /* --- window callbacks ------------------------------------------------------------------------------ */
@@ -903,7 +1426,8 @@ static void on_paint(void *user, hk_window *w, hk_surface *s)
     page *pg = &a->page;
     if (pg->laid_out) {
         if (pg->relayout_pending) relayout_with(a, false); /* images changed sizes */
-        hk_paint(a->painter, &pg->dl, s, a->scroll, hk_window_scale(w), paint_image, pg);
+        hk_paint_hooks hooks = {a, paint_image, paint_control};
+        hk_paint(a->painter, &pg->dl, s, a->scroll, hk_window_scale(w), &hooks);
         return;
     }
     for (int y = 0; y < s->height; y++) {
@@ -945,6 +1469,7 @@ static void on_key(void *user, hk_window *w, hk_key key, unsigned mods)
     float vw, vh;
     viewport_css(a, &vw, &vh);
     float line = 48, pagestep = vh * 0.9f;
+    if (!(mods & HK_MOD_ALT) && form_key(a, key, mods)) return;
     if ((mods & HK_MOD_ALT) && key == HK_KEY_LEFT) key = HK_KEY_BROWSER_BACK;
     if ((mods & HK_MOD_ALT) && key == HK_KEY_RIGHT) key = HK_KEY_BROWSER_FORWARD;
     switch (key) {
@@ -957,7 +1482,24 @@ static void on_key(void *user, hk_window *w, hk_key key, unsigned mods)
     case HK_KEY_END: scroll_by(a, a->page.dl.height); break;
     case HK_KEY_BROWSER_BACK: go_history(a, -1); break;
     case HK_KEY_BROWSER_FORWARD: go_history(a, 1); break;
+    case HK_KEY_TAB: {
+        /* Tab without a focused control: the first control on screen. */
+        for (uint32_t i = 0; i < a->page.dl.items.len; i++) {
+            const hk_item *it = &a->page.dl.items.data[i];
+            if (it->kind == HK_ITEM_CONTROL && !hk_control_disabled(a->page.doc, it->node) &&
+                (it->fixed || it->y + it->h > a->scroll)) {
+                set_focus(a, it->node);
+                scroll_to_focus(a);
+                break;
+            }
+        }
+        break;
+    }
     case HK_KEY_F5:
+        if ((mods & HK_MOD_SHIFT) && a->history_pos && a->history.data[a->history_pos - 1].post) {
+            resubmit(a);
+            break;
+        }
         if (a->history_pos) {
             a->restore_scroll = a->scroll;
             go_history(a, 0);
@@ -991,15 +1533,73 @@ static void on_mouse(void *user, hk_window *w, hk_mouse_event ev, hk_mouse_butto
         go_history(a, 1);
         return;
     }
-    if (!a->page.laid_out) return;
-    float scale = hk_window_scale(w);
-    hk_node_id link = hk_display_list_link_at(&a->page.dl, (float)x / scale, (float)y / scale, a->scroll);
+    page *pg = &a->page;
+    if (!pg->laid_out) return;
+    float scale = hk_window_scale(w), cx = (float)x / scale, cy = (float)y / scale;
+    hk_node_id link = hk_display_list_link_at(&pg->dl, cx, cy, a->scroll);
+    hk_control_kind kind = link ? hk_control_kind_of(pg->doc, link) : HK_CTRL_NONE;
     if (ev == HK_MOUSE_MOVE) {
-        if (!a->page.loading) hk_window_set_cursor(w, link ? HK_CURSOR_HAND : HK_CURSOR_ARROW);
+        if (pg->selecting && focused_text(a)) {
+            const hk_item *it = hk_display_list_control(&pg->dl, pg->focus);
+            if (it) {
+                float sy = it->fixed ? 0 : a->scroll;
+                hk_form_ctx c = form_ctx(a);
+                uint32_t pos = hk_form_view_hit(a->form_view, &c, it, cx - it->x, cy + sy - it->y);
+                hk_forms_set_caret(page_forms(a), pg->focus, pos, true);
+                update_text_input(a);
+                hk_window_invalidate(w);
+            }
+            return;
+        }
+        if (!pg->loading) {
+            bool is_link = link && hk_dom_is_html(pg->doc, link, A(a));
+            hk_window_set_cursor(w, hk_control_is_text(kind) ? HK_CURSOR_TEXT : is_link ? HK_CURSOR_HAND : HK_CURSOR_ARROW);
+        }
         a->hover_link = link;
-    } else if (ev == HK_MOUSE_UP && button == HK_BUTTON_LEFT && link) {
-        follow_link(a, link);
+        return;
     }
+    if (button != HK_BUTTON_LEFT) return;
+    if (ev == HK_MOUSE_DOWN) {
+        pg->pressed = link;
+        if (hk_control_is_text(kind) && !hk_control_disabled(pg->doc, link)) {
+            set_focus(a, link);
+            const hk_item *it = hk_display_list_control(&pg->dl, link);
+            if (it) {
+                float sy = it->fixed ? 0 : a->scroll;
+                hk_form_ctx c = form_ctx(a);
+                uint32_t pos = hk_form_view_hit(a->form_view, &c, it, cx - it->x, cy + sy - it->y);
+                hk_forms_set_caret(page_forms(a), link, pos, false);
+                pg->selecting = true;
+                update_text_input(a);
+            }
+        } else if (kind != HK_CTRL_NONE && !hk_control_disabled(pg->doc, link)) {
+            set_focus(a, link);
+        } else if (!link || hk_dom_is_html(pg->doc, link, A(a))) {
+            if (pg->focus) set_focus(a, HK_NODE_NONE);
+        }
+        return;
+    }
+    /* HK_MOUSE_UP */
+    pg->selecting = false;
+    hk_node_id pressed = pg->pressed;
+    pg->pressed = HK_NODE_NONE;
+    if (!link || link != pressed) return;
+    if (hk_dom_is_html(pg->doc, link, A(a))) {
+        follow_link(a, link);
+    } else if (hk_dom_is_html(pg->doc, link, A(label))) {
+        hk_node_id ctl = hk_label_control(pg->doc, link);
+        if (!ctl || hk_control_disabled(pg->doc, ctl)) return;
+        set_focus(a, ctl);
+        if (!hk_control_is_text(hk_control_kind_of(pg->doc, ctl))) activate_control(a, ctl);
+    } else if (kind != HK_CTRL_NONE && !hk_control_is_text(kind)) {
+        activate_control(a, link);
+    }
+}
+
+static void on_close(void *user, hk_window *w)
+{
+    HK_UNUSED(w);
+    ((app *)user)->window = NULL;
 }
 
 static void on_first_present(void *user, hk_window *w)
@@ -1107,6 +1707,10 @@ int hk_app_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--update-filters") == 0) update_filters = true;
         else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) a.screenshot = argv[++i];
         else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width_css = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fill") == 0 && i + 1 < argc) {
+            if (a.nfill < 8) a.fill[a.nfill++] = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--submit") == 0) a.submit_after_fill = true;
         else if (argv[i][0] != '-' && !url) url = argv[i];
         else HK_LOGW("unknown argument: %s", argv[i]);
     }
@@ -1118,6 +1722,7 @@ int hk_app_main(int argc, char **argv)
     hk_filter_store *store = hk_filter_store_open(data_dir, extra_lists, nextra);
     hk_loader_set_blocker(a.loader, hk_filter_store_blocker(store), hk_filter_store_release, store);
     a.painter = hk_painter_create();
+    a.form_view = hk_form_view_create();
     hk_arena_init(&a.page.url_arena, 4096);
 
     hk_window_desc desc = {0};
@@ -1130,6 +1735,9 @@ int hk_app_main(int argc, char **argv)
     desc.cb.on_key = on_key;
     desc.cb.on_wheel = on_wheel;
     desc.cb.on_mouse = on_mouse;
+    desc.cb.on_char = on_char;
+    desc.cb.on_close = on_close;
+    desc.cb.on_composition = on_composition;
     desc.cb.on_first_present = on_first_present;
 
     hk_status st = hk_window_create(&desc, &a.window);
@@ -1147,10 +1755,12 @@ int hk_app_main(int argc, char **argv)
     }
     int rc = hk_plat_run_loop();
 
+    page_reset(&a); /* cancels the page's requests, so before the loader goes */
     hk_loader_destroy(a.loader);
-    page_reset(&a);
     hk_arena_free(&a.page.url_arena);
     hk_painter_destroy(a.painter);
+    hk_form_view_destroy(a.form_view);
+    free_history_from(&a, 0);
     hk_vec_free(&a.history);
     return rc;
 }

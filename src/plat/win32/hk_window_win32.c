@@ -7,6 +7,8 @@
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <imm.h>
+#include <string.h>
 
 #include "hk_win32_internal.h"
 
@@ -26,9 +28,32 @@ struct hk_window {
     bool dark;
     bool presented;
     hk_cursor cursor;
+    wchar_t high_surrogate; /* the first half of a character arriving in two WM_CHAR messages */
+    bool text_input;
 };
 
 static const wchar_t k_window_class[] = L"HawkWindow";
+
+static LPCWSTR cursor_id(hk_cursor c)
+{
+    switch (c) {
+    case HK_CURSOR_HAND: return IDC_HAND;
+    case HK_CURSOR_WAIT: return IDC_APPSTARTING;
+    case HK_CURSOR_TEXT: return IDC_IBEAM;
+    default: return IDC_ARROW;
+    }
+}
+
+/* Reads an IME string (GCS_COMPSTR or GCS_RESULTSTR) into a heap buffer; returns its length in UTF-16 units. */
+static uint32_t ime_string(HIMC imc, DWORD which, wchar_t **out)
+{
+    LONG bytes = ImmGetCompositionStringW(imc, which, NULL, 0);
+    *out = NULL;
+    if (bytes <= 0) return 0;
+    *out = hk_alloc((size_t)bytes + sizeof(wchar_t));
+    ImmGetCompositionStringW(imc, which, *out, (DWORD)bytes);
+    return (uint32_t)bytes / sizeof(wchar_t);
+}
 static int g_window_count;
 
 /* --- helpers ----------------------------------------------------------------- */
@@ -175,10 +200,16 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case VK_ESCAPE: key = HK_KEY_ESCAPE; break;
         case VK_BROWSER_BACK: key = HK_KEY_BROWSER_BACK; break;
         case VK_BROWSER_FORWARD: key = HK_KEY_BROWSER_FORWARD; break;
+        case VK_TAB: key = HK_KEY_TAB; break;
+        case VK_RETURN: key = HK_KEY_ENTER; break;
+        case VK_BACK: key = HK_KEY_BACKSPACE; break;
+        case VK_DELETE: key = HK_KEY_DELETE; break;
         default: break;
         }
         unsigned mods = (GetKeyState(VK_SHIFT) < 0 ? HK_MOD_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? HK_MOD_CTRL : 0) |
                         (GetKeyState(VK_MENU) < 0 ? HK_MOD_ALT : 0);
+        if (wp >= 'A' && wp <= 'Z' && (mods & (HK_MOD_CTRL | HK_MOD_ALT))) key = (hk_key)(HK_KEY_A + (int)(wp - 'A'));
+        if (wp == VK_PROCESSKEY) break; /* the IME handles this key */
         if (key != HK_KEY_OTHER && w->cb.on_key) {
             w->cb.on_key(w->cb.user, w, key, mods);
             return 0;
@@ -193,6 +224,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
         hk_mouse_event ev = msg == WM_MOUSEMOVE ? HK_MOUSE_MOVE : msg == WM_LBUTTONDOWN ? HK_MOUSE_DOWN : HK_MOUSE_UP;
         hk_mouse_button b = HK_BUTTON_NONE;
+        if (msg == WM_LBUTTONDOWN) SetCapture(hwnd);
+        if (msg == WM_LBUTTONUP) ReleaseCapture();
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) b = HK_BUTTON_LEFT;
         else if (msg == WM_MBUTTONUP) b = HK_BUTTON_MIDDLE;
         else if (msg == WM_XBUTTONUP) b = GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? HK_BUTTON_BACK : HK_BUTTON_FORWARD;
@@ -201,11 +234,62 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            LPCWSTR id = w->cursor == HK_CURSOR_HAND ? IDC_HAND : w->cursor == HK_CURSOR_WAIT ? IDC_APPSTARTING : IDC_ARROW;
-            SetCursor(LoadCursorW(NULL, id));
+            SetCursor(LoadCursorW(NULL, cursor_id(w->cursor)));
             return TRUE;
         }
         break;
+    case WM_CHAR: {
+        wchar_t c = (wchar_t)wp;
+        if (c >= 0xD800 && c < 0xDC00) {
+            w->high_surrogate = c;
+            return 0;
+        }
+        uint32_t cp = c;
+        if (c >= 0xDC00 && c < 0xE000) {
+            if (!w->high_surrogate) return 0;
+            cp = 0x10000 + (((uint32_t)w->high_surrogate - 0xD800) << 10) + (c - 0xDC00);
+        }
+        w->high_surrogate = 0;
+        if (cp >= 0x20 && cp != 0x7F && w->cb.on_char) w->cb.on_char(w->cb.user, w, cp);
+        return 0;
+    }
+    case WM_IME_SETCONTEXT:
+        /* The composition is drawn inline by Hawk; the IME draws only its candidate window. */
+        lp &= ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW;
+        break;
+    case WM_IME_STARTCOMPOSITION:
+        return 0;
+    case WM_IME_COMPOSITION: {
+        HIMC imc = ImmGetContext(hwnd);
+        if (!imc) break;
+        if (lp & GCS_RESULTSTR) {
+            wchar_t *s;
+            uint32_t n = ime_string(imc, GCS_RESULTSTR, &s);
+            if (w->cb.on_composition) w->cb.on_composition(w->cb.user, w, NULL, 0, 0);
+            for (uint32_t i = 0; i < n && w->cb.on_char; i++) {
+                uint32_t cp = s[i];
+                if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + ((uint32_t)s[i + 1] - 0xDC00);
+                    i++;
+                }
+                if (cp >= 0x20 || cp == '\n') w->cb.on_char(w->cb.user, w, cp);
+            }
+            if (s) hk_free(s, (size_t)n * sizeof(wchar_t) + sizeof(wchar_t));
+        }
+        if (lp & GCS_COMPSTR) {
+            wchar_t *s;
+            uint32_t n = ime_string(imc, GCS_COMPSTR, &s);
+            LONG cursor = (lp & GCS_CURSORPOS) ? ImmGetCompositionStringW(imc, GCS_CURSORPOS, NULL, 0) : (LONG)n;
+            if (cursor < 0 || (uint32_t)cursor > n) cursor = (LONG)n;
+            if (w->cb.on_composition) w->cb.on_composition(w->cb.user, w, (const uint16_t *)s, n, (uint32_t)cursor);
+            if (s) hk_free(s, (size_t)n * sizeof(wchar_t) + sizeof(wchar_t));
+        }
+        ImmReleaseContext(hwnd, imc);
+        return 0;
+    }
+    case WM_IME_ENDCOMPOSITION:
+        if (w->cb.on_composition) w->cb.on_composition(w->cb.user, w, NULL, 0, 0);
+        return 0;
     case WM_MOUSEWHEEL:
         if (w->cb.on_wheel) w->cb.on_wheel(w->cb.user, w, (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA);
         return 0;
@@ -271,6 +355,7 @@ hk_status hk_window_create(const hk_window_desc *desc, hk_window **out)
         return HK_ERR_IO;
     }
     w->dpi = GetDpiForWindow(hwnd);
+    ImmAssociateContextEx(hwnd, NULL, 0); /* no IME until a text field has the focus */
     apply_title_bar_theme(w);
     *out = w; /* callbacks during the first show may already use it */
     ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -280,6 +365,7 @@ hk_status hk_window_create(const hk_window_desc *desc, hk_window **out)
 
 void hk_window_set_title(hk_window *w, hk_str title)
 {
+    if (!w) return; /* the window may already be gone (callbacks during shutdown) */
     hk_arena tmp;
     hk_arena_init(&tmp, 1024);
     SetWindowTextW(w->hwnd, (const wchar_t *)hk_utf8_to_utf16(&tmp, title, NULL));
@@ -288,14 +374,112 @@ void hk_window_set_title(hk_window *w, hk_str title)
 
 void hk_window_set_cursor(hk_window *w, hk_cursor cursor)
 {
+    if (!w) return; /* the window may already be gone (callbacks during shutdown) */
     if (w->cursor == cursor) return;
     w->cursor = cursor;
-    LPCWSTR id = cursor == HK_CURSOR_HAND ? IDC_HAND : cursor == HK_CURSOR_WAIT ? IDC_APPSTARTING : IDC_ARROW;
-    SetCursor(LoadCursorW(NULL, id));
+    SetCursor(LoadCursorW(NULL, cursor_id(cursor)));
+}
+
+void hk_window_set_text_input(hk_window *w, bool enabled, int x, int y, int h)
+{
+    if (!w) return; /* the window may already be gone (callbacks during shutdown) */
+    if (enabled != w->text_input) {
+        ImmAssociateContextEx(w->hwnd, NULL, enabled ? IACE_DEFAULT : 0);
+        w->text_input = enabled;
+    }
+    if (!enabled) return;
+    HIMC imc = ImmGetContext(w->hwnd);
+    if (!imc) return;
+    COMPOSITIONFORM cf = {0};
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = x;
+    cf.ptCurrentPos.y = y;
+    ImmSetCompositionWindow(imc, &cf);
+    CANDIDATEFORM cand = {0};
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_EXCLUDE;
+    cand.ptCurrentPos.x = x;
+    cand.ptCurrentPos.y = y + h;
+    cand.rcArea.left = x;
+    cand.rcArea.top = y;
+    cand.rcArea.right = x + 1;
+    cand.rcArea.bottom = y + h;
+    ImmSetCandidateWindow(imc, &cand);
+    ImmReleaseContext(w->hwnd, imc);
+}
+
+int hk_window_popup_menu(hk_window *w, const hk_str *items, const uint8_t *flags, uint32_t n, int x, int y)
+{
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return -1;
+    hk_arena tmp;
+    hk_arena_init(&tmp, 4096);
+    for (uint32_t i = 0; i < n && i < 4000; i++) {
+        UINT f = MF_STRING;
+        if (flags && (flags[i] & 1)) f |= MF_GRAYED;
+        if (flags && (flags[i] & 2)) f |= MF_CHECKED;
+        /* Long menus wrap into columns. */
+        if (i && i % 40 == 0) f |= MF_MENUBARBREAK;
+        const wchar_t *label = (const wchar_t *)hk_utf8_to_utf16(&tmp, items[i].n ? items[i] : HK_STR(" "), NULL);
+        AppendMenuW(menu, f, (UINT_PTR)i + 1, label);
+    }
+    POINT pt = {x, y};
+    ClientToScreen(w->hwnd, &pt);
+    int choice = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, pt.x, pt.y,
+                                       w->hwnd, NULL);
+    DestroyMenu(menu);
+    hk_arena_free(&tmp);
+    return choice - 1;
+}
+
+void hk_plat_clipboard_set(hk_str text)
+{
+    hk_arena tmp;
+    hk_arena_init(&tmp, 1024);
+    size_t n;
+    const uint16_t *w16 = hk_utf8_to_utf16(&tmp, text, &n);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(wchar_t));
+    if (mem) {
+        void *p = GlobalLock(mem);
+        memcpy(p, w16, (n + 1) * sizeof(wchar_t));
+        GlobalUnlock(mem);
+        if (OpenClipboard(NULL)) {
+            EmptyClipboard();
+            if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
+            CloseClipboard();
+        } else {
+            GlobalFree(mem);
+        }
+    }
+    hk_arena_free(&tmp);
+}
+
+bool hk_plat_clipboard_get(hk_charbuf *out)
+{
+    if (!OpenClipboard(NULL)) return false;
+    bool ok = false;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *p = h ? GlobalLock(h) : NULL;
+    if (p) {
+        size_t n = wcslen(p);
+        hk_arena tmp;
+        hk_arena_init(&tmp, 1024);
+        hk_str s = hk_utf16_to_utf8(&tmp, (const uint16_t *)p, n);
+        hk_charbuf_append(out, s.p, s.n);
+        hk_arena_free(&tmp);
+        GlobalUnlock(h);
+        ok = true;
+    }
+    CloseClipboard();
+    return ok;
 }
 
 void hk_window_client_size(const hk_window *w, int *width, int *height)
 {
+    if (!w) {
+        *width = *height = 0;
+        return;
+    }
     RECT r;
     GetClientRect(w->hwnd, &r);
     *width = r.right - r.left;
@@ -334,17 +518,20 @@ hk_status hk_window_save_bmp(hk_window *w, const char *path)
 
 void hk_window_invalidate(hk_window *w)
 {
+    if (!w) return; /* the window may already be gone (callbacks during shutdown) */
     w->dirty = true;
     InvalidateRect(w->hwnd, NULL, FALSE);
 }
 
 void hk_window_close(hk_window *w)
 {
+    if (!w) return; /* the window may already be gone (callbacks during shutdown) */
     PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
 }
 
 float hk_window_scale(const hk_window *w)
 {
+    if (!w) return 1;
     return (float)w->dpi / 96.0f;
 }
 

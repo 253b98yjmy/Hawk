@@ -104,6 +104,15 @@ static void table_box(ctx *c, hk_node_id el, const hk_style *s, flow *parent);
 static void intrinsic(ctx *c, hk_node_id el, const hk_style *s, float *mn, float *mx);
 static void flow_children(flow *f, hk_node_id parent, hk_node_id link);
 
+/* Form controls laid out as replaced boxes (their contents are drawn by the painter). <button>
+   elements are ordinary inline-blocks; their children are laid out. */
+static hk_control_kind replaced_control(const ctx *c, hk_node_id el)
+{
+    if (hk_dom_is_html(c->d, el, A(button))) return HK_CTRL_NONE;
+    hk_control_kind k = hk_control_kind_of(c->d, el);
+    return k == HK_CTRL_HIDDEN ? HK_CTRL_NONE : k;
+}
+
 static bool is_block_level(uint8_t d)
 {
     return d == HK_DISPLAY_BLOCK || d == HK_DISPLAY_LIST_ITEM || d == HK_DISPLAY_TABLE || d == HK_DISPLAY_TABLE_ROW_GROUP ||
@@ -482,6 +491,126 @@ static void push_alt(flow *f, hk_node_id el, const hk_style *s, hk_node_id link)
     if (alt && hk_str_trim_ascii_ws(alt->value).n) push_text(f, s, link, alt->value);
 }
 
+/* --- form controls ---------------------------------------------------------------------------------- */
+
+static void line_sink_run(void *user, const hk_glyph_run *r)
+{
+    float *baseline = user;
+    if (*baseline < 0) *baseline = r->baseline;
+    free_run(r);
+}
+
+void hk_layout_control_line(const hk_styler *st, const hk_style *s, float *height, float *baseline)
+{
+    hk_text_style ts = {0};
+    ts.family = hk_styler_family(st, s->font_family);
+    ts.size = s->font_size;
+    ts.weight = s->font_weight;
+    ts.color = 0xFF000000u;
+    hk_text_para para = {0};
+    para.max_width = BIG;
+    para.line_height = s->line_height;
+    static const uint16_t k_x[] = {'X'};
+    *height = s->font_size * 1.2f;
+    *baseline = s->font_size;
+    hk_text_layout *l = hk_text_layout_create(k_x, 1, &para, &ts);
+    if (!l) return;
+    float w, h, b = -1;
+    hk_text_layout_size(l, &w, &h);
+    hk_text_sink sink = {&b, line_sink_run, NULL, NULL};
+    hk_text_layout_emit(l, &sink);
+    hk_text_layout_destroy(l);
+    if (h > 0) *height = h;
+    if (b >= 0) *baseline = b;
+}
+
+static float text_width(ctx *c, const hk_style *s, hk_str utf8)
+{
+    if (!utf8.n) return 0;
+    hk_arena a;
+    hk_arena_init(&a, 0);
+    size_t n;
+    uint16_t *w = hk_utf8_to_utf16(&a, utf8, &n);
+    hk_text_style ts;
+    text_style(c, s, 0, &ts);
+    ts.color = 0xFF000000u;
+    hk_text_para para = {0};
+    para.max_width = BIG;
+    float mn = 0, mx = 0;
+    hk_text_layout *l = hk_text_layout_create(w, (uint32_t)n, &para, &ts);
+    if (l) {
+        hk_text_layout_intrinsic(l, &mn, &mx);
+        hk_text_layout_destroy(l);
+    }
+    hk_arena_free(&a);
+    return mx;
+}
+
+static uint32_t uint_attr(const hk_document *d, hk_node_id el, hk_atom name, uint32_t fallback)
+{
+    const hk_attr *a = hk_dom_attr(d, el, HK_ATTR_NS_NONE, name);
+    if (!a) return fallback;
+    hk_str v = hk_str_trim_ascii_ws(a->value);
+    uint32_t n = 0;
+    size_t i = 0;
+    while (i < v.n && v.p[i] >= '0' && v.p[i] <= '9' && n < 10000) n = n * 10 + (uint32_t)(v.p[i++] - '0');
+    return i && n ? n : fallback;
+}
+
+/* Content box size of a replaced control. */
+static void control_size(ctx *c, hk_node_id el, hk_control_kind k, const hk_style *s, float *w, float *h)
+{
+    float lh, base;
+    hk_layout_control_line(c->st, s, &lh, &base);
+    float avg = s->font_size * 0.55f;
+    *h = lh;
+    switch (k) {
+    case HK_CTRL_CHECKBOX:
+    case HK_CTRL_RADIO: *w = *h = 13; break;
+    case HK_CTRL_TEXTAREA:
+        *w = avg * (float)uint_attr(c->d, el, A(cols), 20) + 12; /* room for a scroll bar in other browsers */
+        *h = lh * (float)uint_attr(c->d, el, A(rows), 2);
+        break;
+    case HK_CTRL_SELECT: {
+        hk_node_vec opts = {0};
+        hk_charbuf buf = {0};
+        hk_select_options(c->d, el, &opts);
+        float widest = 0;
+        for (uint32_t i = 0; i < opts.len; i++) {
+            float tw = text_width(c, s, hk_option_label(c->d, opts.data[i], &buf));
+            if (tw > widest) widest = tw;
+        }
+        hk_vec_free(&opts);
+        hk_vec_free(&buf);
+        *w = widest + s->font_size * 1.4f; /* the arrow */
+        break;
+    }
+    case HK_CTRL_SUBMIT:
+    case HK_CTRL_IMAGE:
+    case HK_CTRL_RESET:
+    case HK_CTRL_BUTTON:
+    case HK_CTRL_FILE: *w = text_width(c, s, hk_control_button_label(c->d, el)); break;
+    default: *w = avg * (float)uint_attr(c->d, el, A(size), 20); break;
+    }
+}
+
+/* Baseline of a control's first line from its content box top. */
+static float control_baseline(ctx *c, hk_control_kind k, const hk_style *s, float content_h)
+{
+    if (k == HK_CTRL_CHECKBOX || k == HK_CTRL_RADIO) return content_h;
+    float lh, base;
+    hk_layout_control_line(c->st, s, &lh, &base);
+    if (k == HK_CTRL_TEXTAREA) return base;
+    return (content_h - lh) / 2 + base;
+}
+
+static void push_hit(ctx *c, float x, float y, float w, float h, hk_node_id el)
+{
+    if (c->measure || w <= 0 || h <= 0) return;
+    hk_link_rect lr = {x, y, w, h, el, 0};
+    hk_vec_push(&c->dl->links, lr);
+}
+
 /* --- inline-level boxes ------------------------------------------------------------------------------- */
 
 static void shrink_to_fit(ctx *c, hk_node_id el, const hk_style *s, float avail, float *content_w)
@@ -541,6 +670,13 @@ static void inline_block(flow *f, hk_node_id el, const hk_style *s, hk_node_id l
     b.w = content_w + frame + ml + mr;
     b.h = bottom + mt + mb;
     b.baseline = bottom + mt; /* the bottom margin edge sits on the baseline */
+    hk_control_kind k = replaced_control(c, el);
+    if (k == HK_CTRL_NONE && hk_dom_is_html(c->d, el, A(button))) k = HK_CTRL_SUBMIT; /* one line of text, centered */
+    if (k != HK_CTRL_NONE) {
+        float bt = s->border_width[0], pt = px_or(s->padding[0], cbw, 0);
+        float content_h = bottom - bt - pt - px_or(s->padding[2], cbw, 0) - s->border_width[2];
+        b.baseline = mt + bt + pt + control_baseline(c, k, s, content_h);
+    }
     push_box(f, s, link, &b);
 }
 
@@ -549,6 +685,7 @@ static void inline_block(flow *f, hk_node_id el, const hk_style *s, hk_node_id l
 static hk_node_id link_of(const hk_document *d, hk_node_id el, hk_node_id inherited)
 {
     if (hk_dom_is_html(d, el, A(a)) && hk_dom_attr(d, el, HK_ATTR_NS_NONE, A(href))) return el;
+    if (hk_dom_is_html(d, el, A(label)) || hk_dom_is_html(d, el, A(button))) return el;
     return inherited;
 }
 
@@ -701,7 +838,9 @@ static void flow_node(flow *f, hk_node_id node, hk_node_id link)
         else block_box(c, node, s, f);
         return;
     }
-    if (s->display == HK_DISPLAY_INLINE_BLOCK) {
+    if (s->display == HK_DISPLAY_INLINE_BLOCK ||
+        (s->display == HK_DISPLAY_INLINE && (replaced_control(c, node) != HK_CTRL_NONE ||
+                                             hk_dom_is_html(c->d, node, A(button))))) {
         inline_block(f, node, s, lk);
         return;
     }
@@ -727,6 +866,13 @@ static void intrinsic(ctx *c, hk_node_id el, const hk_style *s, float *mn, float
     }
     if (s->display == HK_DISPLAY_TABLE) {
         table_intrinsic(c, el, s, mn, mx);
+        return;
+    }
+    hk_control_kind ck = replaced_control(c, el);
+    if (ck != HK_CTRL_NONE) {
+        float w, h;
+        control_size(c, el, ck, s, &w, &h);
+        *mn = *mx = w + frame;
         return;
     }
     bool saved = c->measure;
@@ -910,8 +1056,29 @@ static float box_contents(ctx *c, hk_node_id el, const hk_style *s, float x, flo
     abs_vec *saved_abs = c->abs;
     if (positioned && s->position != HK_POS_FIXED) c->abs = &own_abs;
 
-    flow_children(&f, el, HK_NODE_NONE);
-    flush_inline(&f);
+    hk_control_kind ck = replaced_control(c, el);
+    uint32_t control_index = UINT32_MAX;
+    if (ck != HK_CTRL_NONE) {
+        float cw, ch;
+        control_size(c, el, ck, s, &cw, &ch);
+        if (!c->measure) {
+            control_index = c->dl->items.len;
+            hk_item *it = push_item(c, HK_ITEM_CONTROL);
+            it->node = el;
+            it->x = f.x;
+            it->y = f.cursor;
+            it->w = content_w;
+            it->h = ch;
+        }
+        if (!f.placed) {
+            f.placed = true;
+            f.first_top = f.cursor;
+        }
+        f.cursor += ch;
+    } else {
+        flow_children(&f, el, HK_NODE_NONE);
+        flush_inline(&f);
+    }
 
     if (!top_sep) top = f.placed ? f.first_top : f.cursor + strut_value(&f.s);
     float bottom;
@@ -952,6 +1119,13 @@ static float box_contents(ctx *c, hk_node_id el, const hk_style *s, float x, flo
     if (s->display == HK_DISPLAY_LIST_ITEM) emit_marker(c, el, s, f.x, f.placed ? f.first_top : top);
 
     float bw = content_w + bl + br + pl + pr, bh = bottom - top;
+    if (control_index != UINT32_MAX) {
+        hk_item *it = &c->dl->items.data[control_index];
+        it->y = top + bt + pt;
+        it->h = bottom - bb - pb - it->y;
+        if (it->h < 0) it->h = 0;
+    }
+    if (ck != HK_CTRL_NONE || hk_dom_is_html(c->d, el, A(button))) push_hit(c, x, top, bw, bh, el);
     if (!c->measure) {
         if (s->overflow_hidden) {
             hk_item *cl = &c->dl->items.data[clip_index];
@@ -1034,7 +1208,9 @@ static void block_box(ctx *c, hk_node_id el, const hk_style *s, flow *parent)
     }
 
     float content_w;
-    if (s->width.unit == HK_LEN_AUTO) {
+    if (s->width.unit == HK_LEN_AUTO && replaced_control(c, el) != HK_CTRL_NONE) {
+        shrink_to_fit(c, el, s, avail_w - ml - mr, &content_w);
+    } else if (s->width.unit == HK_LEN_AUTO) {
         content_w = avail_w - ml - mr - frame;
     } else {
         content_w = px_or(s->width, cbw, 0);
@@ -1503,6 +1679,13 @@ void hk_display_list_free(hk_display_list *dl)
     hk_vec_free(&dl->items);
     hk_vec_free(&dl->links);
     memset(dl, 0, sizeof *dl);
+}
+
+const hk_item *hk_display_list_control(const hk_display_list *dl, hk_node_id el)
+{
+    for (uint32_t i = 0; i < dl->items.len; i++)
+        if (dl->items.data[i].kind == HK_ITEM_CONTROL && dl->items.data[i].node == el) return &dl->items.data[i];
+    return NULL;
 }
 
 hk_node_id hk_display_list_link_at(const hk_display_list *dl, float x, float y, float scroll)

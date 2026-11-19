@@ -30,6 +30,11 @@ typedef struct request {
     hk_charbuf body; /* image requests: the whole body (I/O thread) */
     char *site;      /* top-level page URL; NULL for navigations (each hop is its own site) */
     size_t site_len;
+    hk_charbuf post;    /* form submissions: the body ... */
+    bool is_post;
+    hk_charbuf post_headers; /* ... and its Content-Type and Origin header lines */
+    char *referrer;          /* navigations from a page: its URL (or origin) */
+    size_t referrer_len;
 } request;
 
 struct hk_loader {
@@ -84,6 +89,9 @@ static void free_request(request *r)
 {
     if (r->site) hk_free(r->site, r->site_len + 1);
     hk_vec_free(&r->body);
+    hk_vec_free(&r->post);
+    hk_vec_free(&r->post_headers);
+    if (r->referrer) hk_free(r->referrer, r->referrer_len + 1);
     hk_free(r->url, r->url_len + 1);
     hk_free(r, sizeof *r);
 }
@@ -151,6 +159,7 @@ typedef struct fetch_ctx {
     const char *url;
     size_t url_len;
     bool redirect;
+    int redirect_status;
     hk_str location;
     hk_arena *arena;
     const hk_url *target;
@@ -194,6 +203,7 @@ static bool on_headers(void *user, const hk_http_response *r)
     hk_str location = hk_http_header_get(r, "Location", &has_location);
     if (is_redirect(r->status) && has_location) {
         f->redirect = true;
+        f->redirect_status = r->status;
         f->location = hk_arena_str_dup(f->arena, location);
         return false;
     }
@@ -337,6 +347,43 @@ static void run_data_url(hk_loader *l, request *r)
     finish_request(l, r, HK_OK, "");
 }
 
+static bool same_origin(const hk_url *a, const hk_url *b)
+{
+    return hk_str_eq(a->scheme, b->scheme) && hk_str_eq(a->host, b->host) && a->port == b->port;
+}
+
+/* The Referer header line for a request to target (docs/design/02-network.md, 5), appended to out. */
+static void referer_header(hk_arena *a, const request *r, const hk_url *target, hk_charbuf *out)
+{
+    bool navigation = r->site == NULL;
+    hk_str from_s = navigation ? (hk_str){r->referrer, r->referrer_len} : (hk_str){r->site, r->site_len};
+    hk_url from;
+    if (!from_s.n || hk_url_parse(a, from_s, NULL, &from) != HK_OK || !from.host.n) return;
+    if (!hk_str_eq(from.scheme, HK_STR("https")) && !hk_str_eq(from.scheme, HK_STR("http"))) return;
+    if (hk_str_eq(from.scheme, HK_STR("https")) && !hk_str_eq(target->scheme, HK_STR("https"))) return;
+    bool full = same_origin(&from, target);
+    if (!full && !navigation && !hk_psl_same_site(from.host, target->host)) return; /* cross-site subresource */
+    hk_charbuf_append(out, "Referer: ", 9);
+    hk_charbuf_append(out, from.scheme.p, from.scheme.n);
+    hk_charbuf_append(out, "://", 3);
+    hk_charbuf_append(out, from.host.p, from.host.n);
+    if (from.port >= 0) {
+        char port[16];
+        int n = snprintf(port, sizeof port, ":%d", from.port);
+        hk_charbuf_append(out, port, (size_t)n);
+    }
+    if (full) {
+        hk_charbuf_append(out, from.path.p, from.path.n);
+        if (from.has_query) {
+            hk_charbuf_push(out, '?');
+            hk_charbuf_append(out, from.query.p, from.query.n);
+        }
+    } else {
+        hk_charbuf_push(out, '/');
+    }
+    hk_charbuf_append(out, "\r\n", 2);
+}
+
 static void run_request(hk_loader *l, request *r)
 {
     if (r->url_len > 5 && hk_str_eq_ascii_icase((hk_str){r->url, 5}, HK_STR("data:"))) {
@@ -351,6 +398,7 @@ static void run_request(hk_loader *l, request *r)
     hk_str current = {r->url, r->url_len};
     const hk_url *base = NULL;
     hk_url prev;
+    bool as_post = r->is_post;
 
     for (int hop = 0;; hop++) {
         if (hop > MAX_REDIRECTS) {
@@ -417,8 +465,8 @@ static void run_request(hk_loader *l, request *r)
         f.arena = &a;
         f.target = &url;
         f.site_host = site_host;
-        hk_cache_entry entry;
-        bool have_entry = hk_cache_lookup(l->cache, partition, url.href, &entry);
+        hk_cache_entry entry = {0};
+        bool have_entry = !as_post && hk_cache_lookup(l->cache, partition, url.href, &entry);
         if (have_entry && entry.fresh_until > now) {
             serve_cached(&f, &entry);
             hk_cache_entry_free(&entry);
@@ -443,15 +491,18 @@ static void run_request(hk_loader *l, request *r)
             hk_charbuf_append(&extra, "\r\n", 2);
         }
         if (have_entry) f.cached = &entry;
+        if (as_post) hk_charbuf_append(&extra, r->post_headers.data, r->post_headers.len);
+        referer_header(&a, r, &url, &extra);
         hk_vec_free(&cookie);
         hk_http_callbacks cb = {&f, on_headers, on_body, cancelled};
         hk_http_response resp;
-        st = hk_http_get(l->pool, &a, &url, (hk_str){extra.data, extra.len}, &resp, &cb, err, sizeof err);
+        hk_str body = as_post ? (hk_str){r->post.data ? r->post.data : "", r->post.len} : (hk_str){0};
+        st = hk_http_request(l->pool, &a, &url, (hk_str){extra.data, extra.len}, body, &resp, &cb, err, sizeof err);
         hk_vec_free(&extra);
         if (st == HK_OK && f.not_modified) {
             serve_cached(&f, &entry);
             hk_cache_refresh(l->cache, partition, url.href, &resp, &entry, now);
-        } else if (st == HK_OK && resp.status == 200 && !f.redirect) {
+        } else if (st == HK_OK && resp.status == 200 && !f.redirect && !as_post) {
             if (r->image)
                 hk_cache_store(l->cache, partition, url.href, &resp, (const uint8_t *)r->body.data, r->body.len, now);
             else if (f.capture_ok)
@@ -461,6 +512,7 @@ static void run_request(hk_loader *l, request *r)
         hk_vec_free(&f.capture);
         hk_vec_free(&resp.headers);
         if (st != HK_OK || !f.redirect) break;
+        if (f.redirect_status != 307 && f.redirect_status != 308) as_post = false;
         prev = url;
         base = &prev;
         current = f.location;
@@ -601,6 +653,40 @@ static uint32_t enqueue(hk_loader *l, request *r);
 uint32_t hk_loader_fetch(hk_loader *l, hk_str url, hk_str site, uint32_t type, const hk_load_callbacks *cb)
 {
     return enqueue(l, new_request(url, site, site.n ? type : HK_REQ_DOCUMENT, cb));
+}
+
+static void set_referrer(request *r, hk_str referrer)
+{
+    if (!referrer.n) return;
+    r->referrer = hk_alloc(referrer.n + 1);
+    memcpy(r->referrer, referrer.p, referrer.n);
+    r->referrer[referrer.n] = 0;
+    r->referrer_len = referrer.n;
+}
+
+uint32_t hk_loader_navigate(hk_loader *l, hk_str url, hk_str referrer, const hk_load_callbacks *cb)
+{
+    request *r = new_request(url, (hk_str){0}, HK_REQ_DOCUMENT, cb);
+    set_referrer(r, referrer);
+    return enqueue(l, r);
+}
+
+uint32_t hk_loader_post(hk_loader *l, hk_str url, hk_str content_type, hk_str body, hk_str origin,
+                        hk_str referrer, const hk_load_callbacks *cb)
+{
+    request *r = new_request(url, (hk_str){0}, HK_REQ_DOCUMENT, cb);
+    set_referrer(r, referrer);
+    r->is_post = true;
+    hk_charbuf_append(&r->post, body.p, body.n);
+    hk_charbuf_append(&r->post_headers, "Content-Type: ", 14);
+    hk_charbuf_append(&r->post_headers, content_type.p, content_type.n);
+    hk_charbuf_append(&r->post_headers, "\r\n", 2);
+    if (origin.n) {
+        hk_charbuf_append(&r->post_headers, "Origin: ", 8);
+        hk_charbuf_append(&r->post_headers, origin.p, origin.n);
+        hk_charbuf_append(&r->post_headers, "\r\n", 2);
+    }
+    return enqueue(l, r);
 }
 
 uint32_t hk_loader_fetch_image(hk_loader *l, hk_str url, hk_str site, int max_w, int max_h,
