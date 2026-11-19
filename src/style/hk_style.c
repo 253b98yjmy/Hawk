@@ -59,6 +59,8 @@ struct hk_styler {
     hk_arena style_arena;
     hk_map64 interned;
     uint32_t distinct;
+    hk_map64 keys; /* atom -> KEY_CLASS | KEY_ID present in the document */
+    bool keys_ready;
     /* font families */
     HK_VEC(hk_str) families;
     hk_map64 family_cache;
@@ -70,11 +72,64 @@ struct hk_styler {
 
 /* --- setup -------------------------------------------------------------------------------- */
 
+/* Classes and ids that occur in the document: author rules that need others can never match (there
+   are no scripts to change the document), so they are not kept (hk_css_parse_sheet_filtered). */
+enum { KEY_CLASS = 1, KEY_ID = 2 };
+
+static void collect_keys(hk_styler *s)
+{
+    hk_document *d = s->doc;
+    hk_map64_init(&s->keys);
+    s->keys_ready = true;
+    for (hk_node_id n = 1; n < d->nodes.len; n++) {
+        if (d->nodes.data[n].type != HK_NODE_ELEMENT) continue;
+        const hk_attr *id = hk_dom_attr(d, n, HK_ATTR_NS_NONE, HK_ATOM_id);
+        if (id && id->value.n) {
+            uint64_t a = hk_atom_intern(&d->atoms, id->value), v = 0;
+            hk_map64_get(&s->keys, a, &v);
+            hk_map64_put(&s->keys, a, v | KEY_ID);
+        }
+        const hk_attr *cls = hk_dom_attr(d, n, HK_ATTR_NS_NONE, HK_ATOM_class);
+        if (!cls) continue;
+        hk_str c = cls->value;
+        size_t i = 0;
+        while (i < c.n) {
+            while (i < c.n && hk_ascii_is_ws(c.p[i])) i++;
+            size_t st = i;
+            while (i < c.n && !hk_ascii_is_ws(c.p[i])) i++;
+            if (i == st) continue;
+            uint64_t a = hk_atom_intern(&d->atoms, hk_str_slice(c, st, i)), v = 0;
+            hk_map64_get(&s->keys, a, &v);
+            hk_map64_put(&s->keys, a, v | KEY_CLASS);
+        }
+    }
+}
+
+static bool selector_can_match(void *user, const hk_css_selector *sel)
+{
+    hk_styler *s = user;
+    for (uint32_t i = 0; i < sel->n; i++) {
+        const hk_css_compound *c = &sel->c[i];
+        for (uint32_t k = 0; k < c->n; k++) {
+            const hk_css_simple *x = &c->s[k];
+            uint64_t want = x->kind == HK_SS_CLASS ? KEY_CLASS : x->kind == HK_SS_ID ? KEY_ID : 0, v = 0;
+            if (want && (!hk_map64_get(&s->keys, x->name, &v) || !(v & want))) return false;
+        }
+    }
+    return true;
+}
+
 static void add_sheet(hk_styler *s, hk_str css, uint8_t origin)
 {
     hk_css_sheet sheet;
     hk_str copy = hk_arena_str_dup(&s->doc->arena, css);
-    hk_css_parse_sheet(&s->doc->arena, &s->doc->atoms, copy, &sheet);
+    /* Class and id selectors match case-insensitively in quirks mode: no filtering there. */
+    if (origin != ORIGIN_UA && s->doc->quirks != HK_QUIRKS_FULL) {
+        if (!s->keys_ready) collect_keys(s);
+        hk_css_parse_sheet_filtered(&s->doc->arena, &s->doc->atoms, copy, selector_can_match, s, &sheet);
+    } else {
+        hk_css_parse_sheet(&s->doc->arena, &s->doc->atoms, copy, &sheet);
+    }
     hk_vec_push(&s->sheets, sheet);
     hk_vec_push(&s->origins, origin);
     s->index_valid = false;
@@ -129,6 +184,7 @@ void hk_styler_destroy(hk_styler *s)
     hk_vec_free(&s->inline_style);
     hk_map64_free(&s->interned);
     hk_map64_free(&s->family_cache);
+    if (s->keys_ready) hk_map64_free(&s->keys);
     hk_vec_free(&s->families);
     hk_arena_free(&s->style_arena);
     hk_arena_free(&s->family_arena);

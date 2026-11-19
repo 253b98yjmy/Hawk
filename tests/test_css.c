@@ -6,6 +6,7 @@
 #include "style/hk_style.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 HK_TEST(css_tokenizer)
@@ -166,4 +167,44 @@ HK_TEST(css_cascade)
     hk_styler_stats(f.st, &distinct, &elements, &bytes);
     HK_CHECK(distinct <= elements);
     teardown(&f);
+}
+
+static bool keep_no_drop(void *user, const hk_css_selector *sel)
+{
+    const hk_atom *drop = user;
+    for (uint32_t i = 0; i < sel->n; i++)
+        for (uint32_t k = 0; k < sel->c[i].n; k++)
+            if (sel->c[i].s[k].kind == HK_SS_CLASS && sel->c[i].s[k].name == *drop) return false;
+    return true;
+}
+
+HK_TEST(css_filtered_sheet)
+{
+    hk_arena a;
+    hk_arena_init(&a, 0);
+    hk_atom_table atoms;
+    hk_atom_table_init(&atoms, &a, NULL);
+    hk_atom drop = hk_atom_intern(&atoms, HK_STR("drop"));
+    /* Escaped strings are unescaped into the temporary arena: they must be copied into a. */
+    hk_str src = HK_STR(".drop { color: red } .keep, .drop { content: \"\\41 b\" } "
+                        "@media (min-width: 1px) { .drop .x { color: blue } a[title=\"\\41\"] { --v: \"\\42\" } }"
+                        "@import \"ignored-after-rules.css\";");
+    hk_css_sheet sheet;
+    hk_css_parse_sheet_filtered(&a, &atoms, src, keep_no_drop, &drop, &sheet);
+    HK_CHECK_EQ(sheet.rules.len, 2u);
+    if (sheet.rules.len == 2) {
+        const hk_css_rule *r0 = &sheet.rules.data[0], *r1 = &sheet.rules.data[1];
+        HK_CHECK_EQ(r0->ndecls, 1u);
+        HK_CHECK(r0->ndecls && r0->decls[0].vn > 0);
+        bool found = false;
+        for (uint32_t i = 0; r0->ndecls && i < r0->decls[0].vn; i++)
+            if (r0->decls[0].v[i].type == HK_CT_STRING) found = hk_str_eq(r0->decls[0].v[i].value, HK_STR("Ab"));
+        HK_CHECK(found);
+        HK_CHECK(r1->cond != NULL && r1->cond->media_n > 0);
+        HK_CHECK(hk_str_eq(r1->selectors.sel[0].c[0].s[1].value, HK_STR("A")));
+        HK_CHECK(r1->ndecls == 1 && hk_str_eq(r1->decls[0].custom, HK_STR("--v")));
+    }
+    hk_css_sheet_free(&sheet);
+    hk_atom_table_free(&atoms);
+    hk_arena_free(&a);
 }

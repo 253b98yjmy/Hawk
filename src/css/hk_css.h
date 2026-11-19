@@ -175,8 +175,14 @@ typedef struct hk_css_sheet {
     HK_VEC(hk_str) imports; /* @import URLs, in order */
 } hk_css_sheet;
 
-/* Parses a stylesheet. The sheet's data lives in the arena (the document's). */
+/* Parses a stylesheet. The sheet's data lives in the arena (the document's); src must outlive it. */
 void hk_css_parse_sheet(hk_arena *a, hk_atom_table *atoms, hk_str src, hk_css_sheet *out);
+/* Like hk_css_parse_sheet, but drops the style rules none of whose selectors keep() accepts. The
+ * tokens are made in a temporary arena and only those of kept rules are copied into a, so a large
+ * framework stylesheet costs memory only for the rules a page can use. keep may be NULL. */
+void hk_css_parse_sheet_filtered(hk_arena *a, hk_atom_table *atoms, hk_str src,
+                                 bool (*keep)(void *user, const hk_css_selector *sel), void *user,
+                                 hk_css_sheet *out);
 void hk_css_sheet_free(hk_css_sheet *s);
 
 /* Declarations of a style="" attribute. */

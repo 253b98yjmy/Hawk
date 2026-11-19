@@ -92,6 +92,8 @@ typedef struct flow {
     range_vec ranges;
     box_vec boxes;
     bool space_pending;
+    const hk_style *space_style; /* the style and link of the text the pending space came from */
+    hk_node_id space_link;
     bool has_content;
     /* intrinsic sizing results */
     float imin, imax;
@@ -215,8 +217,23 @@ static bool is_space(uint32_t c)
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
 }
 
+/* A collapsed space belongs to the text it came from (its underline, its link). */
+static void flush_space(flow *f)
+{
+    if (!f->space_pending) return;
+    f->space_pending = false;
+    if (!f->has_content) return;
+    uint32_t at = f->text.len;
+    hk_vec_push(&f->text, (uint16_t)' ');
+    if (f->space_style) {
+        range r = {at, 1, f->space_style, f->space_link};
+        hk_vec_push(&f->ranges, r);
+    }
+}
+
 static void push_text(flow *f, const hk_style *s, hk_node_id link, hk_str utf8)
 {
+    flush_space(f);
     uint32_t start = f->text.len;
     bool collapse = s->white_space == HK_WS_NORMAL || s->white_space == HK_WS_NOWRAP || s->white_space == HK_WS_PRE_LINE;
     bool keep_newlines = s->white_space != HK_WS_NORMAL && s->white_space != HK_WS_NOWRAP;
@@ -226,7 +243,11 @@ static void push_text(flow *f, const hk_style *s, hk_node_id link, hk_str utf8)
         uint32_t cp;
         i += hk_utf8_decode((const uint8_t *)utf8.p + i, utf8.n - i, &cp);
         if (collapse && is_space(cp) && !(keep_newlines && cp == '\n')) {
-            f->space_pending = true;
+            if (!f->space_pending) {
+                f->space_pending = true;
+                f->space_style = s;
+                f->space_link = link;
+            }
             word_start = true;
             continue;
         }
@@ -263,10 +284,7 @@ static void push_text(flow *f, const hk_style *s, hk_node_id link, hk_str utf8)
 
 static void push_box(flow *f, const hk_style *s, hk_node_id link, inline_box *b)
 {
-    if (f->space_pending) {
-        if (f->has_content) hk_vec_push(&f->text, (uint16_t)' ');
-        f->space_pending = false;
-    }
+    flush_space(f);
     b->pos = f->text.len;
     hk_vec_push(&f->text, (uint16_t)0xFFFC);
     range r = {b->pos, 1, s, link};
@@ -844,7 +862,20 @@ static void flow_node(flow *f, hk_node_id node, hk_node_id link)
         inline_block(f, node, s, lk);
         return;
     }
+    /* Inline boxes: their horizontal margins, borders and padding become blank space at their ends. */
+    float left = px_or(s->margin[3], f->w, 0) + s->border_width[3] + px_or(s->padding[3], f->w, 0);
+    float right = px_or(s->margin[1], f->w, 0) + s->border_width[1] + px_or(s->padding[1], f->w, 0);
+    if (left >= 0.5f) {
+        inline_box b = {0};
+        b.w = left;
+        push_box(f, s, lk, &b);
+    }
     flow_children(f, node, lk);
+    if (right >= 0.5f) {
+        inline_box b = {0};
+        b.w = right;
+        push_box(f, s, lk, &b);
+    }
 }
 
 static void flow_children(flow *f, hk_node_id parent, hk_node_id link)
@@ -1208,7 +1239,8 @@ static void block_box(ctx *c, hk_node_id el, const hk_style *s, flow *parent)
     }
 
     float content_w;
-    if (s->width.unit == HK_LEN_AUTO && replaced_control(c, el) != HK_CTRL_NONE) {
+    /* Controls and buttons keep their shrink-to-fit width even when block-level. */
+    if (s->width.unit == HK_LEN_AUTO && (replaced_control(c, el) != HK_CTRL_NONE || hk_dom_is_html(c->d, el, A(button)))) {
         shrink_to_fit(c, el, s, avail_w - ml - mr, &content_w);
     } else if (s->width.unit == HK_LEN_AUTO) {
         content_w = avail_w - ml - mr - frame;

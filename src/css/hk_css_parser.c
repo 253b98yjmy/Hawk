@@ -806,14 +806,62 @@ typedef struct sheet_parser {
     hk_atom_table *atoms;
     hk_css_sheet *sheet;
     bool rules_seen;
+    /* filtering: tokens live in tmp and are copied into a when a rule is kept */
+    hk_arena *tmp;
+    hk_str src;
+    bool (*keep)(void *user, const hk_css_selector *sel);
+    void *user;
 } sheet_parser;
 
+/* A string of a token: inside the source (kept as is) or unescaped in the temporary arena (copied). */
+static hk_str own_str(sheet_parser *sp, hk_str s)
+{
+    if (!sp->tmp || !s.n || (s.p >= sp->src.p && s.p + s.n <= sp->src.p + sp->src.n)) return s;
+    return hk_arena_str_dup(sp->a, s);
+}
+
+/* Tokens referenced by the sheet: copied out of the temporary arena when filtering. */
+static const hk_css_token *own_tokens(sheet_parser *sp, const hk_css_token *t, uint32_t n)
+{
+    if (!sp->tmp || !n) return t;
+    hk_css_token *c = HK_ARENA_NEW_ARRAY(sp->a, hk_css_token, n);
+    for (uint32_t i = 0; i < n; i++) {
+        c[i] = t[i];
+        c[i].value = own_str(sp, t[i].value);
+        c[i].unit = own_str(sp, t[i].unit);
+    }
+    return c;
+}
+
 static void parse_rules(sheet_parser *sp, const hk_css_token *t, uint32_t n, const hk_css_condition *cond, bool top);
+
+/* Attribute values in selectors may be unescaped strings of the temporary arena: copy them. */
+static void own_selectors(sheet_parser *sp, const hk_css_selector_list *l)
+{
+    for (uint32_t i = 0; i < l->n; i++)
+        for (uint32_t j = 0; j < l->sel[i].n; j++)
+            for (uint32_t k = 0; k < l->sel[i].c[j].n; k++) {
+                hk_css_simple *x = (hk_css_simple *)&l->sel[i].c[j].s[k];
+                x->value = own_str(sp, x->value);
+                if (x->inner) own_selectors(sp, x->inner);
+            }
+}
 
 static void style_rule(sheet_parser *sp, span prelude, span block, const hk_css_condition *cond)
 {
     hk_css_rule r = {0};
+    if (sp->keep) {
+        /* Selectors are checked in the temporary arena first; most rules of big sheets stop here. */
+        hk_arena_mark m = hk_arena_get_mark(sp->tmp);
+        hk_css_selector_list probe;
+        bool any = false;
+        if (hk_css_parse_selectors(sp->tmp, sp->atoms, prelude.t, prelude.n, &probe))
+            for (uint32_t i = 0; i < probe.n && !any; i++) any = sp->keep(sp->user, &probe.sel[i]);
+        hk_arena_rewind(sp->tmp, m);
+        if (!any) return;
+    }
     if (!hk_css_parse_selectors(sp->a, sp->atoms, prelude.t, prelude.n, &r.selectors)) return;
+    if (sp->tmp) own_selectors(sp, &r.selectors);
     decl_vec decls = {0};
     parse_declarations(block.t, block.n, &decls);
     if (decls.len == 0) {
@@ -822,6 +870,10 @@ static void style_rule(sheet_parser *sp, span prelude, span block, const hk_css_
     }
     hk_css_decl *arr = HK_ARENA_NEW_ARRAY(sp->a, hk_css_decl, decls.len);
     memcpy(arr, decls.data, decls.len * sizeof *arr);
+    for (uint32_t i = 0; i < decls.len; i++) {
+        arr[i].v = own_tokens(sp, arr[i].v, arr[i].vn);
+        arr[i].custom = own_str(sp, arr[i].custom);
+    }
     r.decls = arr;
     r.ndecls = decls.len;
     r.cond = cond;
@@ -836,7 +888,7 @@ static void at_rule(sheet_parser *sp, const hk_css_token *at, span prelude, span
     if (hk_str_eq_ascii_icase(name, HK_STR("media")) && has_block) {
         hk_css_condition *c = HK_ARENA_NEW(sp->a, hk_css_condition);
         c->parent = cond;
-        c->media = prelude.t;
+        c->media = own_tokens(sp, prelude.t, prelude.n);
         c->media_n = prelude.n;
         parse_rules(sp, block.t, block.n, c, false);
     } else if (hk_str_eq_ascii_icase(name, HK_STR("supports")) && has_block) {
@@ -846,10 +898,10 @@ static void at_rule(sheet_parser *sp, const hk_css_token *at, span prelude, span
     } else if (hk_str_eq_ascii_icase(name, HK_STR("import")) && !has_block && top && !sp->rules_seen) {
         span p = trim(prelude);
         if (p.n && (p.t[0].type == HK_CT_URL || p.t[0].type == HK_CT_STRING)) {
-            hk_vec_push(&sp->sheet->imports, p.t[0].value);
+            hk_vec_push(&sp->sheet->imports, own_str(sp, p.t[0].value));
         } else if (p.n && p.t[0].type == HK_CT_FUNCTION && hk_str_eq_ascii_icase(p.t[0].value, HK_STR("url"))) {
             uint32_t j = skip_ws(p.t, p.n, 1);
-            if (j < p.n && p.t[j].type == HK_CT_STRING) hk_vec_push(&sp->sheet->imports, p.t[j].value);
+            if (j < p.n && p.t[j].type == HK_CT_STRING) hk_vec_push(&sp->sheet->imports, own_str(sp, p.t[j].value));
         }
         return;
     }
@@ -905,8 +957,23 @@ void hk_css_parse_sheet(hk_arena *a, hk_atom_table *atoms, hk_str src, hk_css_sh
     out->arena = a;
     out->source = src;
     hk_css_tokens toks = hk_css_tokenize(a, src);
-    sheet_parser sp = {a, atoms, out, false};
+    sheet_parser sp = {a, atoms, out, false, NULL, src, NULL, NULL};
     parse_rules(&sp, toks.t, toks.n, NULL, true);
+}
+
+void hk_css_parse_sheet_filtered(hk_arena *a, hk_atom_table *atoms, hk_str src,
+                                 bool (*keep)(void *user, const hk_css_selector *sel), void *user,
+                                 hk_css_sheet *out)
+{
+    memset(out, 0, sizeof *out);
+    out->arena = a;
+    out->source = src;
+    hk_arena tmp;
+    hk_arena_init(&tmp, 0);
+    hk_css_tokens toks = hk_css_tokenize(&tmp, src);
+    sheet_parser sp = {a, atoms, out, false, &tmp, src, keep, user};
+    parse_rules(&sp, toks.t, toks.n, NULL, true);
+    hk_arena_free(&tmp);
 }
 
 void hk_css_sheet_free(hk_css_sheet *s)
