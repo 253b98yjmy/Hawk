@@ -1484,9 +1484,13 @@ static bool apply_decl(apply_ctx *c, uint16_t prop, hk_cv_span v)
     case HK_PROP_OVERFLOW_Y:
         if (!kw(v, "visible")) st->overflow_hidden = 1;
         return true;
+    case HK_PROP_OPACITY: {
+        float o;
+        if (hk_cv_number(v, &c->cv, &o)) st->transparent = o <= 0.001f;
+        return true;
+    }
     case HK_PROP_CLIP:
     case HK_PROP_CLIP_PATH:
-    case HK_PROP_OPACITY:
     case HK_PROP_CONTENT: return true;
     default: return false;
     }
@@ -1537,6 +1541,7 @@ static void initial_one(apply_ctx *c, uint16_t prop)
     case HK_PROP_WHITE_SPACE: st->white_space = HK_WS_NORMAL; break;
     case HK_PROP_VISIBILITY: st->visible = 1; break;
     case HK_PROP_WIDTH: st->width = k_initial.width; break;
+    case HK_PROP_OPACITY: st->transparent = 0; break;
     case HK_PROP_HEIGHT: st->height = k_initial.height; break;
     case HK_PROP_MAX_WIDTH: st->max_width = k_initial.max_width; break;
     case HK_PROP_MARGIN: memset(st->margin, 0, sizeof st->margin); break;
@@ -1656,6 +1661,9 @@ static void compute_element(hk_styler *s, hk_node_id el, const hk_style *parent,
     for (int k = 0; k < 4; k++) {
         if (st.border_style[k] == HK_BORDER_NONE) st.border_width[k] = 0;
     }
+    /* opacity: 0 hides the element and everything in it (approximated with visibility, which the
+       descendants inherit). */
+    if (st.transparent) st.visible = 0;
     /* CSS 2.1 9.7: floats and absolutely positioned boxes are blockified. */
     if ((st.floating || st.position == HK_POS_ABSOLUTE || st.position == HK_POS_FIXED) &&
         (st.display == HK_DISPLAY_INLINE || st.display == HK_DISPLAY_INLINE_BLOCK))

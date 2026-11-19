@@ -84,6 +84,7 @@ typedef struct hk_style {
     uint8_t clear;           /* 1 left, 2 right, 3 both */
     uint8_t border_collapse;
     uint8_t valign;          /* 0 baseline, 1 top, 2 middle, 3 bottom (table cells) */
+    uint8_t transparent;     /* opacity: 0 (the element and its contents are not painted) */
     uint32_t background;
     uint32_t border_color[4];
     float border_width[4]; /* top, right, bottom, left; 0 when the style is none */

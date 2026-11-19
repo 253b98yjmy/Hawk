@@ -35,8 +35,12 @@ typedef enum hk_key {
     HK_KEY_ENTER,
     HK_KEY_BACKSPACE,
     HK_KEY_DELETE,
+    HK_KEY_F6,
     HK_KEY_A, /* letters: only reported with Ctrl or Alt held (typed text arrives through on_char) */
     HK_KEY_Z = HK_KEY_A + 25,
+    HK_KEY_0, /* digits: only reported with Ctrl or Alt held */
+    HK_KEY_1,
+    HK_KEY_9 = HK_KEY_0 + 9,
 } hk_key;
 
 #define HK_KEY_LETTER(c) ((hk_key)(HK_KEY_A + ((c) - 'A')))
@@ -89,6 +93,9 @@ typedef struct hk_window_callbacks {
     void (*on_char)(void *user, hk_window *w, uint32_t cp);
     /* The IME composition string (UTF-16) and its cursor; len 0 when the composition ends. */
     void (*on_composition)(void *user, hk_window *w, const uint16_t *text, uint32_t len, uint32_t caret);
+    /* A key pressed in the address bar (Enter, Escape, Tab, function keys and Ctrl/Alt combinations).
+       Return true when handled; otherwise the edit control processes it. */
+    bool (*on_address_key)(void *user, hk_window *w, hk_key key, unsigned mods);
     /* The window is being destroyed; w is invalid after this returns. */
     void (*on_close)(void *user, hk_window *w);
 } hk_window_callbacks;
@@ -123,6 +130,18 @@ void hk_window_set_text_input(hk_window *w, bool enabled, int x, int y, int h);
 /* Shows a native popup menu at (x, y) (physical pixels in the client area) and waits for a choice.
  * flags per item: 1 = disabled, 2 = checked. Returns the chosen index or -1. */
 int hk_window_popup_menu(hk_window *w, const hk_str *items, const uint8_t *flags, uint32_t n, int x, int y);
+
+/* The address bar: a native single-line edit control, created on first use. box is the area it is
+ * centered in (physical pixels); the colors are 0xAARRGGBB. */
+void hk_window_address_place(hk_window *w, int x, int y, int width, int height, uint32_t background, uint32_t text);
+void hk_window_address_set_text(hk_window *w, hk_str text);
+void hk_window_address_get_text(hk_window *w, hk_charbuf *out);
+/* Moves the keyboard focus to the address bar (its text selected) or back to the page. */
+void hk_window_address_focus(hk_window *w);
+void hk_window_focus_page(hk_window *w);
+bool hk_window_address_has_focus(const hk_window *w);
+/* The modifier keys held now (HK_MOD_*). */
+unsigned hk_plat_key_mods(void);
 
 /* The clipboard as UTF-8 text. */
 void hk_plat_clipboard_set(hk_str text);

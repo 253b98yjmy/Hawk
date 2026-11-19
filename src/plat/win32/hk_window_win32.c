@@ -30,6 +30,15 @@ struct hk_window {
     hk_cursor cursor;
     wchar_t high_surrogate; /* the first half of a character arriving in two WM_CHAR messages */
     bool text_input;
+    /* the address bar */
+    HWND edit;
+    WNDPROC edit_proc;
+    HFONT edit_font;
+    UINT edit_font_dpi;
+    HBRUSH edit_brush;
+    COLORREF edit_bg, edit_fg;
+    bool edit_fresh;   /* focused by a click that has not been released yet */
+    bool edit_swallow; /* the character of a handled key follows */
 };
 
 static const wchar_t k_window_class[] = L"HawkWindow";
@@ -42,6 +51,40 @@ static LPCWSTR cursor_id(hk_cursor c)
     case HK_CURSOR_TEXT: return IDC_IBEAM;
     default: return IDC_ARROW;
     }
+}
+
+unsigned hk_plat_key_mods(void)
+{
+    return (GetKeyState(VK_SHIFT) < 0 ? HK_MOD_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? HK_MOD_CTRL : 0) |
+           (GetKeyState(VK_MENU) < 0 ? HK_MOD_ALT : 0);
+}
+
+static hk_key key_of(WPARAM wp, unsigned mods)
+{
+    switch (wp) {
+    case VK_UP: return HK_KEY_UP;
+    case VK_DOWN: return HK_KEY_DOWN;
+    case VK_LEFT: return HK_KEY_LEFT;
+    case VK_RIGHT: return HK_KEY_RIGHT;
+    case VK_PRIOR: return HK_KEY_PAGE_UP;
+    case VK_NEXT: return HK_KEY_PAGE_DOWN;
+    case VK_HOME: return HK_KEY_HOME;
+    case VK_END: return HK_KEY_END;
+    case VK_SPACE: return HK_KEY_SPACE;
+    case VK_F5: return HK_KEY_F5;
+    case VK_F6: return HK_KEY_F6;
+    case VK_ESCAPE: return HK_KEY_ESCAPE;
+    case VK_BROWSER_BACK: return HK_KEY_BROWSER_BACK;
+    case VK_BROWSER_FORWARD: return HK_KEY_BROWSER_FORWARD;
+    case VK_TAB: return HK_KEY_TAB;
+    case VK_RETURN: return HK_KEY_ENTER;
+    case VK_BACK: return HK_KEY_BACKSPACE;
+    case VK_DELETE: return HK_KEY_DELETE;
+    default: break;
+    }
+    if (wp >= 'A' && wp <= 'Z' && (mods & (HK_MOD_CTRL | HK_MOD_ALT))) return (hk_key)(HK_KEY_A + (int)(wp - 'A'));
+    if (wp >= '0' && wp <= '9' && (mods & (HK_MOD_CTRL | HK_MOD_ALT))) return (hk_key)(HK_KEY_0 + (int)(wp - '0'));
+    return HK_KEY_OTHER;
 }
 
 /* Reads an IME string (GCS_COMPSTR or GCS_RESULTSTR) into a heap buffer; returns its length in UTF-16 units. */
@@ -185,30 +228,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
-        hk_key key = HK_KEY_OTHER;
-        switch (wp) {
-        case VK_UP: key = HK_KEY_UP; break;
-        case VK_DOWN: key = HK_KEY_DOWN; break;
-        case VK_LEFT: key = HK_KEY_LEFT; break;
-        case VK_RIGHT: key = HK_KEY_RIGHT; break;
-        case VK_PRIOR: key = HK_KEY_PAGE_UP; break;
-        case VK_NEXT: key = HK_KEY_PAGE_DOWN; break;
-        case VK_HOME: key = HK_KEY_HOME; break;
-        case VK_END: key = HK_KEY_END; break;
-        case VK_SPACE: key = HK_KEY_SPACE; break;
-        case VK_F5: key = HK_KEY_F5; break;
-        case VK_ESCAPE: key = HK_KEY_ESCAPE; break;
-        case VK_BROWSER_BACK: key = HK_KEY_BROWSER_BACK; break;
-        case VK_BROWSER_FORWARD: key = HK_KEY_BROWSER_FORWARD; break;
-        case VK_TAB: key = HK_KEY_TAB; break;
-        case VK_RETURN: key = HK_KEY_ENTER; break;
-        case VK_BACK: key = HK_KEY_BACKSPACE; break;
-        case VK_DELETE: key = HK_KEY_DELETE; break;
-        default: break;
-        }
-        unsigned mods = (GetKeyState(VK_SHIFT) < 0 ? HK_MOD_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? HK_MOD_CTRL : 0) |
-                        (GetKeyState(VK_MENU) < 0 ? HK_MOD_ALT : 0);
-        if (wp >= 'A' && wp <= 'Z' && (mods & (HK_MOD_CTRL | HK_MOD_ALT))) key = (hk_key)(HK_KEY_A + (int)(wp - 'A'));
+        unsigned mods = hk_plat_key_mods();
+        hk_key key = key_of(wp, mods);
         if (wp == VK_PROCESSKEY) break; /* the IME handles this key */
         if (key != HK_KEY_OTHER && w->cb.on_key) {
             w->cb.on_key(w->cb.user, w, key, mods);
@@ -224,7 +245,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
         hk_mouse_event ev = msg == WM_MOUSEMOVE ? HK_MOUSE_MOVE : msg == WM_LBUTTONDOWN ? HK_MOUSE_DOWN : HK_MOUSE_UP;
         hk_mouse_button b = HK_BUTTON_NONE;
-        if (msg == WM_LBUTTONDOWN) SetCapture(hwnd);
+        if (msg == WM_LBUTTONDOWN) {
+            SetCapture(hwnd);
+            if (GetFocus() != hwnd) SetFocus(hwnd); /* from the address bar to the page */
+        }
         if (msg == WM_LBUTTONUP) ReleaseCapture();
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) b = HK_BUTTON_LEFT;
         else if (msg == WM_MBUTTONUP) b = HK_BUTTON_MIDDLE;
@@ -253,6 +277,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (cp >= 0x20 && cp != 0x7F && w->cb.on_char) w->cb.on_char(w->cb.user, w, cp);
         return 0;
     }
+    case WM_CTLCOLOREDIT:
+        if ((HWND)lp == w->edit) {
+            SetTextColor((HDC)wp, w->edit_fg);
+            SetBkColor((HDC)wp, w->edit_bg);
+            return (LRESULT)w->edit_brush;
+        }
+        break;
     case WM_IME_SETCONTEXT:
         /* The composition is drawn inline by Hawk; the IME draws only its candidate window. */
         lp &= ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW;
@@ -298,6 +329,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_DESTROY:
         if (w->cb.on_close) w->cb.on_close(w->cb.user, w);
+        if (w->edit) {
+            /* Children are destroyed after this message: unhook the address bar before w goes away. */
+            SetWindowLongPtrW(w->edit, GWLP_WNDPROC, (LONG_PTR)w->edit_proc);
+            SetWindowLongPtrW(w->edit, GWLP_USERDATA, 0);
+            DestroyWindow(w->edit);
+            w->edit = NULL;
+        }
+        if (w->edit_font) DeleteObject(w->edit_font);
+        if (w->edit_brush) DeleteObject(w->edit_brush);
         release_back_buffer(w);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         hk_free(w, sizeof *w);
@@ -345,7 +385,7 @@ hk_status hk_window_create(const hk_window_desc *desc, hk_window **out)
     const wchar_t *title = (const wchar_t *)hk_utf8_to_utf16(&tmp, desc->title, NULL);
 
     /* Created hidden so the title bar theme is set before the first frame is shown. */
-    HWND hwnd = CreateWindowExW(0, k_window_class, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowExW(0, k_window_class, title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
                                 CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
                                 GetModuleHandleW(NULL), w);
     hk_arena_free(&tmp);
@@ -378,6 +418,170 @@ void hk_window_set_cursor(hk_window *w, hk_cursor cursor)
     if (w->cursor == cursor) return;
     w->cursor = cursor;
     SetCursor(LoadCursorW(NULL, cursor_id(cursor)));
+}
+
+/* --- the address bar ---------------------------------------------------------------------------- */
+
+static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    hk_window *w = (hk_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        unsigned mods = hk_plat_key_mods();
+        hk_key key = key_of(wp, mods);
+        bool offer = key == HK_KEY_ENTER || key == HK_KEY_ESCAPE || key == HK_KEY_TAB || key == HK_KEY_F5 ||
+                     key == HK_KEY_F6 || key == HK_KEY_BROWSER_BACK || key == HK_KEY_BROWSER_FORWARD ||
+                     (key >= HK_KEY_A && key <= HK_KEY_9) ||
+                     ((mods & HK_MOD_ALT) && (key == HK_KEY_LEFT || key == HK_KEY_RIGHT));
+        if (offer && w->cb.on_address_key && w->cb.on_address_key(w->cb.user, w, key, mods)) {
+            w->edit_swallow = true;
+            return 0;
+        }
+        if (key == HK_KEY_BACKSPACE && (mods & HK_MOD_CTRL)) {
+            /* Ctrl+Backspace: delete the previous word (the edit control would insert a box). */
+            DWORD start = 0, end = 0;
+            SendMessageW(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+            if (start == end && start > 0) {
+                int n = GetWindowTextLengthW(hwnd);
+                wchar_t *buf = hk_alloc(((size_t)n + 1) * sizeof(wchar_t));
+                GetWindowTextW(hwnd, buf, n + 1);
+                DWORD p = start;
+                while (p > 0 && buf[p - 1] == ' ') p--;
+                while (p > 0 && buf[p - 1] != ' ' && buf[p - 1] != '/' && buf[p - 1] != '.') p--;
+                if (p == start) p--;
+                hk_free(buf, ((size_t)n + 1) * sizeof(wchar_t));
+                SendMessageW(hwnd, EM_SETSEL, p, start);
+            }
+            SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
+            w->edit_swallow = true;
+            return 0;
+        }
+        if (key == HK_KEY_LETTER('A') && mods == HK_MOD_CTRL) {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            w->edit_swallow = true;
+            return 0;
+        }
+        break;
+    }
+    case WM_CHAR:
+    case WM_SYSCHAR:
+        if (w->edit_swallow || wp == '\r' || wp == '\n' || wp == '\t' || wp == 0x1B || wp == 0x7F) {
+            w->edit_swallow = false;
+            return 0;
+        }
+        break;
+    case WM_KEYUP:
+        w->edit_swallow = false;
+        break;
+    case WM_LBUTTONDOWN:
+        if (GetFocus() != hwnd) w->edit_fresh = true;
+        break;
+    case WM_LBUTTONUP: {
+        LRESULT r = CallWindowProcW(w->edit_proc, hwnd, msg, wp, lp);
+        DWORD start = 0, end = 0;
+        SendMessageW(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+        if (w->edit_fresh && start == end) SendMessageW(hwnd, EM_SETSEL, 0, -1); /* a click selects all */
+        w->edit_fresh = false;
+        return r;
+    }
+    default: break;
+    }
+    return CallWindowProcW(w->edit_proc, hwnd, msg, wp, lp);
+}
+
+static COLORREF colorref(uint32_t argb)
+{
+    return RGB((argb >> 16) & 255, (argb >> 8) & 255, argb & 255);
+}
+
+void hk_window_address_place(hk_window *w, int x, int y, int width, int height, uint32_t background, uint32_t text)
+{
+    if (!w) return;
+    if (!w->edit) {
+        w->edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, w->hwnd, NULL,
+                                  GetModuleHandleW(NULL), NULL);
+        if (!w->edit) return;
+        SetWindowLongPtrW(w->edit, GWLP_USERDATA, (LONG_PTR)w);
+        w->edit_proc = (WNDPROC)SetWindowLongPtrW(w->edit, GWLP_WNDPROC, (LONG_PTR)edit_proc);
+        SendMessageW(w->edit, EM_SETLIMITTEXT, 8192, 0);
+    }
+    if (!w->edit_font || w->edit_font_dpi != w->dpi) {
+        if (w->edit) {
+            /* Children are destroyed after this message: unhook the address bar before w goes away. */
+            SetWindowLongPtrW(w->edit, GWLP_WNDPROC, (LONG_PTR)w->edit_proc);
+            SetWindowLongPtrW(w->edit, GWLP_USERDATA, 0);
+            DestroyWindow(w->edit);
+            w->edit = NULL;
+        }
+        if (w->edit_font) DeleteObject(w->edit_font);
+        w->edit_font = CreateFontW(-MulDiv(14, (int)w->dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        w->edit_font_dpi = w->dpi;
+        SendMessageW(w->edit, WM_SETFONT, (WPARAM)w->edit_font, TRUE);
+    }
+    COLORREF bg = colorref(background), fg = colorref(text);
+    if (!w->edit_brush || bg != w->edit_bg) {
+        if (w->edit_brush) DeleteObject(w->edit_brush);
+        w->edit_brush = CreateSolidBrush(bg);
+        w->edit_bg = bg;
+        InvalidateRect(w->edit, NULL, TRUE);
+    }
+    if (fg != w->edit_fg) {
+        w->edit_fg = fg;
+        InvalidateRect(w->edit, NULL, TRUE);
+    }
+    /* The edit control draws its text at the top: center a box one line high. */
+    HDC dc = GetDC(w->edit);
+    HGDIOBJ old = SelectObject(dc, w->edit_font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, old);
+    ReleaseDC(w->edit, dc);
+    int line = tm.tmHeight + 2, pad = MulDiv(10, (int)w->dpi, 96);
+    if (line > height) line = height;
+    SetWindowPos(w->edit, NULL, x + pad, y + (height - line) / 2, width - 2 * pad > 10 ? width - 2 * pad : 10, line,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void hk_window_address_set_text(hk_window *w, hk_str text)
+{
+    if (!w || !w->edit) return;
+    hk_arena tmp;
+    hk_arena_init(&tmp, 1024);
+    SetWindowTextW(w->edit, (const wchar_t *)hk_utf8_to_utf16(&tmp, text, NULL));
+    hk_arena_free(&tmp);
+}
+
+void hk_window_address_get_text(hk_window *w, hk_charbuf *out)
+{
+    if (!w || !w->edit) return;
+    int n = GetWindowTextLengthW(w->edit);
+    wchar_t *buf = hk_alloc(((size_t)n + 1) * sizeof(wchar_t));
+    int got = GetWindowTextW(w->edit, buf, n + 1);
+    hk_arena tmp;
+    hk_arena_init(&tmp, 1024);
+    hk_str s = hk_utf16_to_utf8(&tmp, (const uint16_t *)buf, (size_t)got);
+    hk_charbuf_append(out, s.p, s.n);
+    hk_arena_free(&tmp);
+    hk_free(buf, ((size_t)n + 1) * sizeof(wchar_t));
+}
+
+void hk_window_address_focus(hk_window *w)
+{
+    if (!w || !w->edit) return;
+    SetFocus(w->edit);
+    SendMessageW(w->edit, EM_SETSEL, 0, -1);
+}
+
+void hk_window_focus_page(hk_window *w)
+{
+    if (w) SetFocus(w->hwnd);
+}
+
+bool hk_window_address_has_focus(const hk_window *w)
+{
+    return w && w->edit && GetFocus() == w->edit;
 }
 
 void hk_window_set_text_input(hk_window *w, bool enabled, int x, int y, int h)

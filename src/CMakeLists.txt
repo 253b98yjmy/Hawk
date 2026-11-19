@@ -92,6 +92,7 @@ endif()
 # --- hawk.exe ---------------------------------------------------------------
 add_executable(hawk WIN32
     main.c
+    ui/hk_chrome.c
     plat/win32/hk_entry_win32.c
     plat/win32/hawk.manifest
 )

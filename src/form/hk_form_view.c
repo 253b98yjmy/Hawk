@@ -353,6 +353,8 @@ bool hk_form_view_visual(hk_form_view *v, const hk_form_ctx *c, const hk_item *i
 {
     free_runs(v);
     v->under.len = v->over.len = 0;
+    const hk_style *s = hk_style_of(c->st, it->node);
+    if (!s || !s->visible) return false;
     hk_control_kind k = hk_control_kind_of(c->doc, it->node);
     switch (k) {
     case HK_CTRL_TEXT:
