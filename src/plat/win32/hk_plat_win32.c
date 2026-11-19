@@ -46,13 +46,11 @@ static void set_policy(PROCESS_MITIGATION_POLICY kind, void *policy, size_t size
  *  - child process prohibition: "open folder" / external players need to spawn processes
  *  - non-system font blocking: would hide fonts users installed per-user
  *  - Microsoft-signed-only images: would block third-party IMEs
+ *  - extension point disabling: Microsoft IME and Mozc then stop converting in Hawk's own window (the
+ *    text fields of pages), although the address bar (an EDIT control) keeps working
  */
 static void apply_mitigations(void)
 {
-    PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ext = {0};
-    ext.DisableExtensionPoints = 1; /* AppInit DLLs, global hooks, legacy IMM-only IMEs */
-    set_policy(ProcessExtensionPointDisablePolicy, &ext, sizeof ext, "extension points");
-
     PROCESS_MITIGATION_IMAGE_LOAD_POLICY img = {0};
     img.NoRemoteImages = 1;
     img.NoLowMandatoryLabelImages = 1;
