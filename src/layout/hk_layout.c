@@ -157,6 +157,94 @@ static void free_run(const hk_glyph_run *r)
     hk_free(r->offsets, r->count * 2 * sizeof(float));
 }
 
+/* The used corner radii of a w x h border box (CSS Backgrounds 3, 5.5: when adjacent radii add up to
+   more than the side, all of them are reduced by the same factor). Returns false when all are 0. */
+static bool used_radii(const hk_style *s, float w, float h, float r[8])
+{
+    bool any = false;
+    for (int i = 0; i < 8; i++) {
+        r[i] = hk_length_resolve(s->radius[i], (i & 1) ? h : w, 0);
+        if (r[i] < 0) r[i] = 0;
+        if (r[i] > 0) any = true;
+    }
+    if (!any) return false;
+    /* A corner with one radius 0 is square. */
+    for (int k = 0; k < 4; k++) {
+        if (r[2 * k] <= 0 || r[2 * k + 1] <= 0) r[2 * k] = r[2 * k + 1] = 0;
+    }
+    float f = 1;
+    float sums[4] = {r[0] + r[2], r[3] + r[5], r[4] + r[6], r[7] + r[1]}; /* top, right, bottom, left */
+    float sides[4] = {w, h, w, h};
+    for (int k = 0; k < 4; k++) {
+        if (sums[k] > sides[k] && sums[k] > 0) {
+            float g = sides[k] / sums[k];
+            if (g < f) f = g;
+        }
+    }
+    any = false;
+    for (int i = 0; i < 8; i++) {
+        r[i] *= f;
+        if (r[i] > 0) any = true;
+    }
+    return any;
+}
+
+/* Fills the background and border slots [slot, slot + 5) of a box with border box (x, y, w, h). A box
+   with rounded corners uses the first two slots: a rounded background and a rounded border ring. */
+static void box_decoration(ctx *c, uint32_t slot, const hk_style *s, float x, float y, float w, float h)
+{
+    if (!s->visible || w <= 0 || h <= 0) return;
+    hk_item *items = c->dl->items.data + slot;
+    float r[8];
+    if (used_radii(s, w, h, r)) {
+        bool border = false;
+        for (int k = 0; k < 4; k++) {
+            if (s->border_width[k] > 0 && (s->border_color[k] >> 24)) border = true;
+        }
+        if (s->background >> 24) {
+            items[0].kind = HK_ITEM_RBOX;
+            items[0].color = s->background;
+            items[0].x = x;
+            items[0].y = y;
+            items[0].w = w;
+            items[0].h = h;
+            memcpy(items[0].rbox.r, r, sizeof r);
+        }
+        if (border) {
+            items[1].kind = HK_ITEM_RBOX;
+            items[1].color = 0xFF000000u; /* not transparent: the painter skips transparent items */
+            items[1].x = x;
+            items[1].y = y;
+            items[1].w = w;
+            items[1].h = h;
+            memcpy(items[1].rbox.r, r, sizeof r);
+            for (int k = 0; k < 4; k++) {
+                items[1].rbox.bw[k] = s->border_width[k];
+                items[1].rbox.bc[k] = s->border_width[k] > 0 ? s->border_color[k] : 0;
+            }
+        }
+        return;
+    }
+    if (s->background >> 24) {
+        items[0].color = s->background;
+        items[0].x = x;
+        items[0].y = y;
+        items[0].w = w;
+        items[0].h = h;
+    }
+    float bt = s->border_width[0], br = s->border_width[1], bb = s->border_width[2], bl = s->border_width[3];
+    float rects[4][4] = {{x, y, w, bt}, {x + w - br, y, br, h}, {x, y + h - bb, w, bb}, {x, y, bl, h}};
+    for (int k = 0; k < 4; k++) {
+        hk_item *bd = &items[1 + k];
+        if (s->border_width[k] <= 0 || (s->border_color[k] >> 24) == 0) continue;
+        bd->color = s->border_color[k];
+        bd->x = rects[k][0];
+        bd->y = rects[k][1];
+        bd->w = rects[k][2];
+        bd->h = rects[k][3];
+    }
+}
+
 /* Moves the items [from, to) and links [lfrom, lto) by (dx, dy). */
 static void translate(ctx *c, uint32_t from, uint32_t to, uint32_t lfrom, uint32_t lto, float dx, float dy)
 {
@@ -352,6 +440,8 @@ static void sink_box(void *user, float x, float y, uint32_t box_user)
         it->y = by + b->mt;
         it->w = b->w - b->ml;
         it->h = b->h - b->mt;
+        const hk_style *is = hk_style_of(p->c->st, b->image);
+        if (is) used_radii(is, it->w, it->h, it->rbox.r);
         return;
     }
     translate(p->c, b->items_start, b->items_end, b->links_start, b->links_end, bx + b->ml, by + b->mt);
@@ -824,6 +914,7 @@ static void flow_node(flow *f, hk_node_id node, hk_node_id link)
             it->y = y;
             it->w = w;
             it->h = h;
+            used_radii(s, w, h, it->rbox.r);
             if (!f->placed) {
                 f->placed = true;
                 f->first_top = y;
@@ -1170,26 +1261,7 @@ static float box_contents(ctx *c, hk_node_id el, const hk_style *s, float x, flo
             cl->h = bh;
             push_item(c, HK_ITEM_UNCLIP);
         }
-        if (s->visible) {
-            hk_item *bg = &c->dl->items.data[bg_index];
-            if ((s->background >> 24) && bw > 0 && bh > 0) {
-                bg->color = s->background;
-                bg->x = x;
-                bg->y = top;
-                bg->w = bw;
-                bg->h = bh;
-            }
-            float rects[4][4] = {{x, top, bw, bt}, {x + bw - br, top, br, bh}, {x, bottom - bb, bw, bb}, {x, top, bl, bh}};
-            for (int k = 0; k < 4; k++) {
-                hk_item *bd = &c->dl->items.data[bg_index + 1 + k];
-                if (s->border_width[k] <= 0 || (s->border_color[k] >> 24) == 0) continue;
-                bd->color = s->border_color[k];
-                bd->x = rects[k][0];
-                bd->y = rects[k][1];
-                bd->w = rects[k][2];
-                bd->h = rects[k][3];
-            }
-        }
+        box_decoration(c, bg_index, s, x, top, bw, bh);
         /* Absolutely positioned descendants: this box is their containing block (padding box). */
         if (c->abs == &own_abs) {
             c->abs = saved_abs;
@@ -1598,6 +1670,8 @@ static void table_box(ctx *c, hk_node_id el, const hk_style *s, flow *parent)
         hk_item *right = &c->dl->items.data[k->bg_index + 2], *left = &c->dl->items.data[k->bg_index + 4];
         if (right->w) right->h = avail_h;
         if (left->w) left->h = avail_h;
+        hk_item *ring = &c->dl->items.data[k->bg_index + 1]; /* rounded corners: the whole border */
+        if (ring->kind == HK_ITEM_RBOX) ring->h = avail_h;
         hk_item *bottom_b = &c->dl->items.data[k->bg_index + 3];
         if (bottom_b->h) bottom_b->y = row_top + avail_h - bottom_b->h;
     }
@@ -1615,26 +1689,7 @@ static void table_box(ctx *c, hk_node_id el, const hk_style *s, flow *parent)
     float bottom = y + pb + bb;
     if (s->height.unit == HK_LEN_PX && bottom - top < s->height.px) bottom = top + s->height.px;
     float bw = content_w + frame, bh = bottom - top;
-    if (s->visible) {
-        hk_item *bg = &c->dl->items.data[bg_index];
-        if (s->background >> 24) {
-            bg->color = s->background;
-            bg->x = x;
-            bg->y = top;
-            bg->w = bw;
-            bg->h = bh;
-        }
-        float rects[4][4] = {{x, top, bw, bt}, {x + bw - br, top, br, bh}, {x, bottom - bb, bw, bb}, {x, top, bl, bh}};
-        for (int k = 0; k < 4; k++) {
-            hk_item *bd = &c->dl->items.data[bg_index + 1 + k];
-            if (s->border_width[k] <= 0 || (s->border_color[k] >> 24) == 0) continue;
-            bd->color = s->border_color[k];
-            bd->x = rects[k][0];
-            bd->y = rects[k][1];
-            bd->w = rects[k][2];
-            bd->h = rects[k][3];
-        }
-    }
+    box_decoration(c, bg_index, s, x, top, bw, bh);
     if (s->position == HK_POS_RELATIVE) {
         float dx = s->inset[3].unit != HK_LEN_AUTO ? px_or(s->inset[3], cbw, 0) : 0;
         float dy = s->inset[0].unit != HK_LEN_AUTO ? px_or(s->inset[0], 0, 0) : 0;

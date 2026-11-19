@@ -88,6 +88,9 @@ typedef struct hk_style {
     uint32_t background;
     uint32_t border_color[4];
     float border_width[4]; /* top, right, bottom, left; 0 when the style is none */
+    /* border-radius: horizontal and vertical radius of each corner (top-left, top-right, bottom-right,
+       bottom-left), so radius[2 * corner] and radius[2 * corner + 1]. Percentages are of the border box. */
+    hk_length radius[8];
     hk_length margin[4];
     hk_length padding[4];
     hk_length width, height, min_width, max_width, min_height, max_height;

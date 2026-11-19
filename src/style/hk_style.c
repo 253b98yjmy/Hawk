@@ -1219,6 +1219,47 @@ static bool apply_box(apply_ctx *c, hk_cv_span v, hk_length *box, uint32_t flags
     return true;
 }
 
+/* border-radius: 1 to 4 horizontal radii, then optionally "/" and 1 to 4 vertical radii. */
+static bool apply_radius(apply_ctx *c, hk_cv_span v)
+{
+    hk_cv_span p[9];
+    uint32_t n = hk_cv_split(v, p, 9), slash = n;
+    for (uint32_t i = 0; i < n; i++) {
+        if (p[i].n == 1 && p[i].t[0].type == HK_CT_DELIM && p[i].t[0].delim == '/') slash = i;
+    }
+    uint32_t nh = slash, nv = slash < n ? n - slash - 1 : 0;
+    if (nh < 1 || nh > 4 || (slash < n && (nv < 1 || nv > 4))) return false;
+    hk_length h[4], vr[4];
+    for (uint32_t i = 0; i < nh; i++) {
+        if (!hk_cv_length(p[i], &c->cv, HK_CV_PERCENT, &h[i])) return false;
+    }
+    for (uint32_t i = 0; i < nv; i++) {
+        if (!hk_cv_length(p[slash + 1 + i], &c->cv, HK_CV_PERCENT, &vr[i])) return false;
+    }
+    /* Missing values repeat like margin: top-left, top-right, bottom-right, bottom-left. */
+    static const uint8_t k_from[4][4] = {{0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+    for (int k = 0; k < 4; k++) {
+        c->st->radius[2 * k] = h[k_from[nh - 1][k]];
+        c->st->radius[2 * k + 1] = nv ? vr[k_from[nv - 1][k]] : c->st->radius[2 * k];
+    }
+    return true;
+}
+
+/* border-*-radius: one or two radii (horizontal, vertical). */
+static bool apply_corner(apply_ctx *c, hk_cv_span v, int corner)
+{
+    hk_cv_span p[3];
+    uint32_t n = hk_cv_split(v, p, 3);
+    if (n < 1 || n > 2) return false;
+    hk_length a, b;
+    if (!hk_cv_length(p[0], &c->cv, HK_CV_PERCENT, &a)) return false;
+    if (n < 2) b = a;
+    else if (!hk_cv_length(p[1], &c->cv, HK_CV_PERCENT, &b)) return false;
+    c->st->radius[2 * corner] = a;
+    c->st->radius[2 * corner + 1] = b;
+    return true;
+}
+
 static void inherit_one(apply_ctx *c, uint16_t prop);
 static void initial_one(apply_ctx *c, uint16_t prop);
 
@@ -1357,6 +1398,15 @@ static bool apply_decl(apply_ctx *c, uint16_t prop, hk_cv_span v)
         memcpy(st->border_color, b, sizeof b);
         return true;
     }
+    case HK_PROP_BORDER_RADIUS: return apply_radius(c, v);
+    case HK_PROP_BORDER_TOP_LEFT_RADIUS:
+    case HK_PROP_BORDER_START_START_RADIUS: return apply_corner(c, v, 0);
+    case HK_PROP_BORDER_TOP_RIGHT_RADIUS:
+    case HK_PROP_BORDER_START_END_RADIUS: return apply_corner(c, v, 1);
+    case HK_PROP_BORDER_BOTTOM_RIGHT_RADIUS:
+    case HK_PROP_BORDER_END_END_RADIUS: return apply_corner(c, v, 2);
+    case HK_PROP_BORDER_BOTTOM_LEFT_RADIUS:
+    case HK_PROP_BORDER_END_START_RADIUS: return apply_corner(c, v, 3);
     case HK_PROP_BORDER_TOP_WIDTH:
     case HK_PROP_BORDER_RIGHT_WIDTH:
     case HK_PROP_BORDER_BOTTOM_WIDTH:
@@ -1602,6 +1652,7 @@ static void initial_one(apply_ctx *c, uint16_t prop)
     case HK_PROP_MAX_WIDTH: st->max_width = k_initial.max_width; break;
     case HK_PROP_MARGIN: memset(st->margin, 0, sizeof st->margin); break;
     case HK_PROP_PADDING: memset(st->padding, 0, sizeof st->padding); break;
+    case HK_PROP_BORDER_RADIUS: memset(st->radius, 0, sizeof st->radius); break;
     case HK_PROP_POSITION: st->position = HK_POS_STATIC; break;
     case HK_PROP_FLOAT: st->floating = 0; break;
     case HK_PROP_TEXT_DECORATION:

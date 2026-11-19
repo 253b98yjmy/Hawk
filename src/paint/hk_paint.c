@@ -149,8 +149,106 @@ static void draw_mask_clipped(hk_surface *s, const clip *c, const cached_glyph *
     }
 }
 
-/* Scales an image into the device rectangle (bilinear when shrinking little, nearest otherwise). */
-static void draw_image(hk_surface *s, const clip *c, int x0, int y0, int x1, int y1, const uint32_t *px, int pw, int ph)
+/* --- rounded boxes -------------------------------------------------------------------------------- */
+
+/* Signed distance (device px, negative inside) from a point to a rectangle whose corners are quarter
+   ellipses with radii r (top-left x, y, top-right x, y, bottom-right x, y, bottom-left x, y). Inside a
+   corner the ellipse distance is estimated to first order, which is exact enough within a pixel of the
+   edge, where it decides the coverage. */
+static float rbox_dist(float px, float py, float x0, float y0, float x1, float y1, const float r[8])
+{
+    float cx = 0, cy = 0, rx = 0, ry = 0;
+    if (px < x0 + r[0] && py < y0 + r[1]) cx = x0 + (rx = r[0]), cy = y0 + (ry = r[1]);
+    else if (px > x1 - r[2] && py < y0 + r[3]) cx = x1 - (rx = r[2]), cy = y0 + (ry = r[3]);
+    else if (px > x1 - r[4] && py > y1 - r[5]) cx = x1 - (rx = r[4]), cy = y1 - (ry = r[5]);
+    else if (px < x0 + r[6] && py > y1 - r[7]) cx = x0 + (rx = r[6]), cy = y1 - (ry = r[7]);
+    if (rx > 0 && ry > 0) {
+        float u = (px - cx) / rx, v = (py - cy) / ry;
+        float g = sqrtf(u * u / (rx * rx) + v * v / (ry * ry));
+        if (g < 1e-6f) return -(rx < ry ? rx : ry);
+        return (u * u + v * v - 1) / (2 * g);
+    }
+    float d = x0 - px;
+    if (px - x1 > d) d = px - x1;
+    if (y0 - py > d) d = y0 - py;
+    if (py - y1 > d) d = py - y1;
+    return d;
+}
+
+static inline float coverage(float d)
+{
+    float c = 0.5f - d;
+    return c <= 0 ? 0 : c >= 1 ? 1 : c;
+}
+
+/* A rounded background, or (b != NULL) a rounded border ring with widths b->bw and colors b->bc. The
+   box is (x0, y0)-(x1, y1) in device px; r and the widths are in device px too. */
+static void fill_rbox(hk_surface *s, const clip *cl, float x0, float y0, float x1, float y1, const float r[8],
+                      const float *bw, const uint32_t *bc, uint32_t color)
+{
+    int ix0 = (int)floorf(x0), iy0 = (int)floorf(y0), ix1 = (int)ceilf(x1), iy1 = (int)ceilf(y1);
+    if (ix0 < cl->x0) ix0 = cl->x0;
+    if (iy0 < cl->y0) iy0 = cl->y0;
+    if (ix1 > cl->x1) ix1 = cl->x1;
+    if (iy1 > cl->y1) iy1 = cl->y1;
+    if (ix0 >= ix1 || iy0 >= iy1) return;
+    /* The padding box: the inner edge of the ring, its radii reduced by the border widths. */
+    float in_x0 = 0, in_y0 = 0, in_x1 = 0, in_y1 = 0, ir[8] = {0}, band0 = 0, band1 = 0;
+    if (bw) {
+        in_x0 = x0 + bw[3], in_y0 = y0 + bw[0], in_x1 = x1 - bw[1], in_y1 = y1 - bw[2];
+        const float sub[8] = {bw[3], bw[0], bw[1], bw[0], bw[1], bw[2], bw[3], bw[2]};
+        for (int i = 0; i < 8; i++) ir[i] = r[i] - sub[i] > 0 ? r[i] - sub[i] : 0;
+        for (int k = 0; k < 4; k++) {
+            if (ir[2 * k] <= 0 || ir[2 * k + 1] <= 0) ir[2 * k] = ir[2 * k + 1] = 0;
+        }
+        /* Rows whose inside lies on the straight part of the padding box: skip that inside. */
+        band0 = in_y0 + (ir[1] > ir[3] ? ir[1] : ir[3]);
+        band1 = in_y1 - (ir[5] > ir[7] ? ir[5] : ir[7]);
+    }
+    for (int y = iy0; y < iy1; y++) {
+        uint32_t *row = s->pixels + (size_t)y * (size_t)s->stride;
+        float py = (float)y + 0.5f;
+        int skip0 = ix1, skip1 = ix1;
+        if (bw && py - 0.5f >= band0 && py + 0.5f <= band1) {
+            skip0 = (int)ceilf(in_x0 + (ir[0] > ir[6] ? ir[0] : ir[6]));
+            skip1 = (int)floorf(in_x1 - (ir[2] > ir[4] ? ir[2] : ir[4]));
+            if (skip1 < skip0) skip0 = skip1 = ix1;
+        }
+        for (int x = ix0; x < ix1; x++) {
+            if (x == skip0) {
+                x = skip1 - 1;
+                continue;
+            }
+            float px = (float)x + 0.5f;
+            float cov = coverage(rbox_dist(px, py, x0, y0, x1, y1, r));
+            if (cov <= 0) continue;
+            uint32_t c = color;
+            if (bw) {
+                cov *= 1 - coverage(rbox_dist(px, py, in_x0, in_y0, in_x1, in_y1, ir));
+                if (cov <= 0) continue;
+                /* The side the pixel belongs to: the nearest edge relative to its width, which splits the
+                   corners along the line between the outer and inner corners. */
+                float best = 1e30f;
+                int side = 0;
+                const float dist[4] = {py - y0, x1 - px, y1 - py, px - x0};
+                for (int k = 0; k < 4; k++) {
+                    if (bw[k] <= 0) continue;
+                    float t = dist[k] / bw[k];
+                    if (t < best) best = t, side = k;
+                }
+                c = bc[side];
+                if ((c >> 24) == 0) continue;
+            }
+            if (cov >= 1 && (c >> 24) == 255) row[x] = c;
+            else row[x] = blend(row[x], c, (uint32_t)(cov * 255 + 0.5f));
+        }
+    }
+}
+
+/* Scales an image into the device rectangle (bilinear when shrinking little, nearest otherwise). With
+   radii (device px) the corners are rounded. */
+static void draw_image(hk_surface *s, const clip *c, int x0, int y0, int x1, int y1, const uint32_t *px, int pw, int ph,
+                       const float *radii)
 {
     int w = x1 - x0, h = y1 - y0;
     if (w <= 0 || h <= 0 || pw <= 0 || ph <= 0) return;
@@ -166,6 +264,11 @@ static void draw_image(hk_surface *s, const clip *c, int x0, int y0, int x1, int
             if (sx >= pw) sx = pw - 1;
             uint32_t v = src[sx];
             uint32_t a = v >> 24;
+            if (radii) {
+                float cov = coverage(rbox_dist((float)x + 0.5f, (float)y + 0.5f, (float)x0, (float)y0, (float)x1,
+                                               (float)y1, radii));
+                a = (uint32_t)(a * cov + 0.5f);
+            }
             if (a == 255) row[x] = v;
             else if (a) row[x] = blend(row[x], v | 0xFF000000u, a);
         }
@@ -303,9 +406,28 @@ static void paint_pass(hk_painter *p, const hk_display_list *dl, hk_surface *s, 
         if (it->kind == HK_ITEM_IMAGE) {
             const uint32_t *px;
             int pw, ph;
-            if (hooks && hooks->image && hooks->image(hooks->user, it->node, &px, &pw, &ph))
+            if (hooks && hooks->image && hooks->image(hooks->user, it->node, &px, &pw, &ph)) {
+                float r[8];
+                bool round = false;
+                for (int k = 0; k < 8; k++) {
+                    r[k] = it->rbox.r[k] * scale;
+                    if (r[k] > 0) round = true;
+                }
                 draw_image(s, cl, snap(it->x * scale), snap((it->y - scroll) * scale), snap((it->x + it->w) * scale),
-                           snap((it->y + it->h - scroll) * scale), px, pw, ph);
+                           snap((it->y + it->h - scroll) * scale), px, pw, ph, round ? r : NULL);
+            }
+            continue;
+        }
+        if (it->kind == HK_ITEM_RBOX) {
+            float r[8], bw[4];
+            bool ring = false;
+            for (int k = 0; k < 8; k++) r[k] = it->rbox.r[k] * scale;
+            for (int k = 0; k < 4; k++) {
+                bw[k] = it->rbox.bw[k] * scale;
+                if (bw[k] > 0) ring = true;
+            }
+            fill_rbox(s, cl, it->x * scale, (it->y - scroll) * scale, (it->x + it->w) * scale,
+                      (it->y + it->h - scroll) * scale, r, ring ? bw : NULL, it->rbox.bc, it->color);
             continue;
         }
         if (it->kind == HK_ITEM_GLYPHS) draw_run(p, s, cl, &it->run, 0, -scroll, scale);

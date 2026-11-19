@@ -22,7 +22,18 @@ typedef enum hk_item_kind {
     HK_ITEM_CLIP,   /* starts clipping to (x, y, w, h) until the matching HK_ITEM_UNCLIP */
     HK_ITEM_UNCLIP,
     HK_ITEM_CONTROL, /* node = a form control; (x, y, w, h) is its content box, drawn by the painter's hook */
+    HK_ITEM_RBOX,    /* a box with rounded corners: (x, y, w, h) is the border box; see hk_rbox */
 } hk_item_kind;
+
+/* A rounded box. Without borders (all of bw 0) it is a background filled with the item's color;
+ * otherwise it is the border ring between the border box and the padding box, each side in its color.
+ * Image items use r alone, to round the image. */
+typedef struct hk_rbox {
+    float r[8];     /* horizontal and vertical radius per corner (top-left, top-right, bottom-right,
+                       bottom-left), in px, already reduced so that adjacent corners do not overlap */
+    float bw[4];    /* border widths: top, right, bottom, left */
+    uint32_t bc[4]; /* border colors */
+} hk_rbox;
 
 typedef struct hk_item {
     uint8_t kind;
@@ -30,7 +41,10 @@ typedef struct hk_item {
     uint32_t color;
     float x, y, w, h; /* bounds (for glyphs: an estimate used for culling) */
     hk_node_id node;
-    hk_glyph_run run; /* glyphs: positions are absolute */
+    union {
+        hk_glyph_run run; /* glyphs: positions are absolute */
+        hk_rbox rbox;     /* HK_ITEM_RBOX, and HK_ITEM_IMAGE with rounded corners */
+    };
 } hk_item;
 
 /* A clickable area: a link, a <label>, a <button> or a form control (their border boxes). */
